@@ -48,4 +48,17 @@ YTDLP_PATH = shutil.which("yt-dlp") or "yt-dlp"
 THUMB_MAX_WIDTH = 32
 THUMB_MAX_HEIGHT = 14
 DEFAULT_REGION = "US"
-DEFAULT_VO_DRIVER = os.environ.get("TIKCLI_VO", "tct")
+
+
+def get_default_vo_driver() -> str:
+    env_driver = os.environ.get("TIKCLI_VO")
+    if env_driver:
+        return env_driver.lower()
+    term = os.environ.get("TERM", "").lower()
+    # Default to Sixel on Foot / Sway for crystal-clear high-definition video
+    if "foot" in term or os.environ.get("SWAYSOCK"):
+        return "sixel"
+    return "tct"
+
+
+DEFAULT_VO_DRIVER = get_default_vo_driver()

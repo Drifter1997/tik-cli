@@ -20,6 +20,7 @@ from tikcli.config import (
 from tikcli.client import TikTokClient
 from tikcli.media import (
     get_inline_thumbnail,
+    play_feed_in_terminal,
     play_video_in_terminal,
     play_audio_in_terminal,
     download_video,
@@ -462,8 +463,8 @@ class TerminalUI:
 
         # 1. Inline Thumbnail via chafa in RAM
         cover_url = video.get("cover_url", "")
-        thumb_h = min(14, max(8, height - 12))
-        thumb_w = min(width - 4, 30)
+        thumb_h = max(10, min(24, height - 8))
+        thumb_w = min(width - 4, 36)
 
         if cover_url:
             cache_key = f"{cover_url}:{thumb_w}x{thumb_h}"
@@ -473,22 +474,26 @@ class TerminalUI:
             thumb_lines = self._thumbnail_cache[cache_key]
             for t_line in thumb_lines[:thumb_h]:
                 vis_len = len(strip_ansi(t_line))
-                pad = " " * max(0, width - vis_len)
-                # Append intact ANSI line with reset and spaces - NEVER slice raw ANSI escape string
-                lines.append(f"{t_line}{RESET}{pad}")
+                margin_left = max(0, (width - vis_len) // 2)
+                margin_right = max(0, width - vis_len - margin_left)
+                lines.append(f"{' ' * margin_left}{t_line}{RESET}{' ' * margin_right}")
         else:
-            lines.append(f"{DIM}[No thumbnail available]{RESET}".ljust(width))
+            no_thumb = f"{DIM}[No thumbnail available]{RESET}"
+            vis_len = len(strip_ansi(no_thumb))
+            margin_left = max(0, (width - vis_len) // 2)
+            margin_right = max(0, width - vis_len - margin_left)
+            lines.append(f"{' ' * margin_left}{no_thumb}{' ' * margin_right}")
 
         lines.append(" " * width)
 
         # 2. Author and stats
         author_name = video.get("author_name") or video.get("author_id", "Creator")
-        author_line = f"{BOLD}{WHITE}{author_name}{RESET} {CYAN}@{video.get('author_id')}{RESET}"
+        author_line = f"  {BOLD}{WHITE}{author_name}{RESET} {CYAN}@{video.get('author_id')}{RESET}"
         pad = " " * max(0, width - len(strip_ansi(author_line)))
         lines.append(f"{author_line}{pad}")
 
         stats_row = (
-            f"{RED}♥ {format_count(video.get('likes', 0))}{RESET}   "
+            f"  {RED}♥ {format_count(video.get('likes', 0))}{RESET}   "
             f"{CYAN}▶ {format_count(video.get('views', 0))}{RESET}   "
             f"{YELLOW}💬 {format_count(video.get('comments', 0))}{RESET}   "
             f"{DIM}⏱ {format_duration(video.get('duration', 0))}{RESET}"
@@ -498,17 +503,17 @@ class TerminalUI:
 
         # 3. Title / Caption
         title = video.get("title", "").strip()
-        lines.append(f"{DIM}Caption:{RESET}".ljust(width))
-        wrapped = [title[j:j + width - 4] for j in range(0, min(160, len(title)), max(1, width - 4))]
+        lines.append(f"  {DIM}Caption:{RESET}".ljust(width))
+        wrapped = [title[j:j + width - 6] for j in range(0, min(160, len(title)), max(1, width - 6))]
         for w in wrapped[:3]:
-            cap_line = f"  {LIGHT_GRAY}{w}{RESET}"
+            cap_line = f"    {LIGHT_GRAY}{w}{RESET}"
             pad = " " * max(0, width - len(strip_ansi(cap_line)))
             lines.append(f"{cap_line}{pad}")
 
         # 4. Music Track
         music = video.get("music_title", "").strip()
         if music:
-            music_line = f"{DIM}Sound:{RESET} 🎵 {music[:max(10, width - 12)]}"
+            music_line = f"  {DIM}Sound:{RESET} 🎵 {music[:max(10, width - 14)]}"
             pad = " " * max(0, width - len(strip_ansi(music_line)))
             lines.append(f"{music_line}{pad}")
 
@@ -555,7 +560,7 @@ class TerminalUI:
         else:
             # Controls and Dynamic Status bar
             shortcuts = (
-                f"{BOLD}[Enter]{RESET} Watch in Terminal  "
+                f"{BOLD}[Enter]{RESET} Watch (Loop/Scroll)  "
                 f"{BOLD}[:d]{RESET} Download  "
                 f"{BOLD}[:m]{RESET} Audio  "
                 f"{BOLD}[/]{RESET} Search/@  "
@@ -724,26 +729,31 @@ class TerminalUI:
         return None
 
     def action_play_selected(self):
-        """Play the selected video inside terminal cells with mpv."""
-        video = self.get_selected_video()
-        if not video:
+        """Play feed in terminal with looping, next/prev scrolling, and pos tracking."""
+        items = self.feed_items if self.mode == "feed" else self.creator_items
+        idx = self.feed_index if self.mode == "feed" else self.creator_index
+        if not items or not (0 <= idx < len(items)):
             self.set_status("No video selected.", RED)
             return
 
-        play_url = video.get("play_url") or video.get("web_url")
-        if not play_url:
-            self.set_status("No playable URL for this video.", RED)
-            return
-
-        self.set_status(f"Playing in terminal ({self.vo_driver.upper()}): {video.get('title', '')[:25]}...", CYAN)
+        video = items[idx]
+        author = video.get("author_id", "creator")
+        self.set_status(f"Feed playback ({self.vo_driver.upper()}): @{author} [j/↓: Next, k/↑: Prev, ESC/q: Exit]", CYAN)
         self.draw()
-        success, msg = play_video_in_terminal(
-            play_url,
-            title=video.get("title", ""),
+
+        new_idx, msg = play_feed_in_terminal(
+            items=items,
+            start_index=idx,
             vo_driver=self.vo_driver
         )
+
+        if self.mode == "feed":
+            self.feed_index = new_idx
+        else:
+            self.creator_index = new_idx
+
         self.force_clear = True
-        self.set_status(msg, GREEN if success else RED)
+        self.set_status(msg, GREEN)
 
 
     def action_download_selected(self):

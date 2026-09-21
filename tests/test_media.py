@@ -18,3 +18,26 @@ def test_play_video_empty_url():
     success, msg = play_video_in_terminal("")
     assert not success
     assert "No video URL" in msg
+
+
+def test_get_terminal_pixel_size():
+    from tikcli.media import get_terminal_pixel_size
+    w, h = get_terminal_pixel_size()
+    assert isinstance(w, int) and w > 0
+    assert isinstance(h, int) and h > 0
+
+
+def test_play_feed_empty_list():
+    from tikcli.media import play_feed_in_terminal
+    idx, msg = play_feed_in_terminal([], start_index=0)
+    assert idx == 0
+    assert "No videos" in msg
+
+
+def test_play_feed_no_urls():
+    from tikcli.media import play_feed_in_terminal
+    items = [{"title": "No URL", "duration": 10}]
+    idx, msg = play_feed_in_terminal(items, start_index=0)
+    assert idx == 0
+    assert "No playable videos" in msg
+

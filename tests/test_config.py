@@ -18,3 +18,10 @@ def test_ram_dir_writable():
     test_file.write_text("ok")
     assert test_file.read_text() == "ok"
     test_file.unlink()
+
+
+def test_get_default_vo_driver():
+    from tikcli.config import get_default_vo_driver
+    driver = get_default_vo_driver()
+    assert driver in ("sixel", "tct")
+

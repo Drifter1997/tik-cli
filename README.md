@@ -78,13 +78,16 @@ A minimal, fast, and hackable CLI/TUI TikTok client designed for Neovim users an
 | `q` or `Ctrl+C` | Quit |
 
 ### Video Playback Controls (Inside Terminal)
+TikTok-style continuous feed playback: each video loops continuously until you scroll to the next video or exit.
+
 | Key | Action |
 |---|---|
+| `j` / `↓` / `PageDown` / `Wheel Down` | **Next video** (swipes down like TikTok) |
+| `k` / `↑` / `PageUp` / `Wheel Up` | **Previous video** (swipes up like TikTok) |
 | `Space` | Pause / Resume |
 | `←` / `→` | Seek -5s / +5s |
-| `↑` / `↓` | Volume Up / Down |
 | `m` | Toggle mute |
-| `q` | Stop playback and return to TUI |
+| `ESC` / `q` / `Ctrl+C` | Stop playback and return to TUI at current video |
 
 ### Commands (Type `:`)
 | Command | Action |

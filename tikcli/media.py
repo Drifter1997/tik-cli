@@ -42,6 +42,34 @@ def fetch_bytes_in_ram(url: str, timeout: int = 15) -> Optional[bytes]:
     return None
 
 
+def get_terminal_pixel_size() -> Tuple[int, int]:
+    """
+    Determine exact terminal pixel dimensions.
+    Queries Sway window geometry on Wayland (eDP-1 / foot), with TIOCGWINSZ / cell fallback.
+    """
+    if os.environ.get("SWAYSOCK"):
+        try:
+            res = subprocess.run(["swaymsg", "-t", "get_tree"], capture_output=True, text=True, timeout=1)
+            import json
+            tree = json.loads(res.stdout)
+            def find_foot(node):
+                if node.get("app_id") == "foot" and node.get("visible", True):
+                    return node.get("rect")
+                for c in node.get("nodes", []) + node.get("floating_nodes", []):
+                    f = find_foot(c)
+                    if f:
+                        return f
+                return None
+            rect = find_foot(tree)
+            if rect and rect.get("width", 0) > 0 and rect.get("height", 0) > 0:
+                return int(rect["width"]), int(rect["height"])
+        except Exception:
+            pass
+
+    cols, rows = shutil.get_terminal_size((80, 24))
+    return int(cols * 9.6), int(rows * 19.5)
+
+
 def get_inline_thumbnail(image_url: str, max_width: int = THUMB_MAX_WIDTH, max_height: int = THUMB_MAX_HEIGHT) -> str:
     """Generate crisp TrueColor ANSI terminal thumbnail using chafa, cached in RAM."""
     if not image_url:
@@ -56,14 +84,16 @@ def get_inline_thumbnail(image_url: str, max_width: int = THUMB_MAX_WIDTH, max_h
         return ""
 
     try:
-        # Run chafa with 24-bit TrueColor, sharp block characters, and no dither artifacts
+        # Run chafa with 24-bit TrueColor, clean half-block pixel grid, and median color accuracy
         result = subprocess.run(
             [
                 CHAFA_PATH,
                 "-s", f"{max_width}x{max_height}",
                 "--format=symbols",
                 "-c", "full",
-                "--symbols=vhalf+hhalf+block+border",
+                "--symbols=half",
+                "--color-extractor=median",
+                "--work=9",
                 "--dither=none",
                 "--polite=on",
                 "-"
@@ -74,7 +104,6 @@ def get_inline_thumbnail(image_url: str, max_width: int = THUMB_MAX_WIDTH, max_h
         )
         if result.returncode == 0 and result.stdout:
             raw_lines = result.stdout.decode("utf-8", errors="replace").splitlines()
-            # Ensure each line terminates with ANSI reset to prevent color bleeding
             clean_lines = [line.rstrip() + "\033[0m" for line in raw_lines if line.strip()]
             rendered = "\n".join(clean_lines)
             _THUMBNAIL_CACHE[cache_key] = rendered
@@ -85,54 +114,142 @@ def get_inline_thumbnail(image_url: str, max_width: int = THUMB_MAX_WIDTH, max_h
     return ""
 
 
-def play_video_in_terminal(
-    video_url: str,
-    title: str = "",
-    extra_headers: Optional[Dict[str, str]] = None,
+def play_feed_in_terminal(
+    items: List[Dict[str, Any]],
+    start_index: int = 0,
     vo_driver: Optional[str] = None
-) -> Tuple[bool, str]:
+) -> Tuple[int, str]:
     """
-    Play video directly inside terminal cells, scaling to full terminal height and width.
-    Ensures ZERO external popup windows.
-    Eliminates the 320x240 tiny video bug by passing explicit terminal dimensions.
+    Play TikTok feed in terminal with native looping and next/prev scrolling:
+    - Current video plays on continuous loop (just like TikTok app).
+    - Down arrow / 'j' / PageDown: forwards to NEXT video and loops it.
+    - Up arrow / 'k' / PageUp: goes back to PREVIOUS video and loops it.
+    - ESC / 'q' / Ctrl+C: stops playback and returns to TUI at the current video position.
     """
-    if not video_url:
-        return False, "No video URL provided."
+    if not items:
+        return start_index, "No videos in feed to play."
 
     if not shutil.which(MPV_PATH) and not Path(MPV_PATH).exists():
-        return False, f"mpv player not found at '{MPV_PATH}'."
+        return start_index, f"mpv player not found at '{MPV_PATH}'."
+
+    from tikcli.config import DEFAULT_VO_DRIVER, RAM_DIR
+    RAM_DIR.mkdir(parents=True, exist_ok=True)
+    selected_driver = (vo_driver or DEFAULT_VO_DRIVER or "sixel").lower()
+
+    # 1. Filter playable items and maintain index mapping
+    valid_entries: List[Tuple[int, Dict[str, Any]]] = []
+    for idx, v in enumerate(items):
+        play_url = v.get("play_url") or v.get("web_url", "")
+        if play_url:
+            valid_entries.append((idx, v))
+
+    if not valid_entries:
+        return start_index, "No playable videos found in feed."
+
+    # Find the M3U start index matching start_index
+    m3u_start_idx = 0
+    for m_idx, (orig_idx, _) in enumerate(valid_entries):
+        if orig_idx == start_index:
+            m3u_start_idx = m_idx
+            break
+        elif orig_idx < start_index:
+            m3u_start_idx = m_idx
+
+    m3u_file = RAM_DIR / "feed_playlist.m3u"
+    m3u_lines = ["#EXTM3U"]
+    for orig_idx, v in valid_entries:
+        dur = v.get("duration", 0)
+        author = v.get("author_id", "creator")
+        title = (v.get("title") or f"TikTok by @{author}").replace("\n", " ")[:50]
+        play_url = v.get("play_url") or v.get("web_url", "")
+        m3u_lines.append(f"#EXTINF:{dur},@{author} - {title}")
+        m3u_lines.append(play_url)
+
+    m3u_file.write_text("\n".join(m3u_lines) + "\n")
+
+    # 2. Input conf for TikTok-style scrolling & loop controls
+    input_conf_file = RAM_DIR / "feed_input.conf"
+    input_conf_content = (
+        "j playlist-next\n"
+        "DOWN playlist-next\n"
+        "PGDWN playlist-next\n"
+        "WHEEL_DOWN playlist-next\n"
+        "k playlist-prev\n"
+        "UP playlist-prev\n"
+        "PGUP playlist-prev\n"
+        "WHEEL_UP playlist-prev\n"
+        "ESC quit 0\n"
+        "q quit 0\n"
+        "Ctrl+c quit 0\n"
+        "SPACE cycle pause\n"
+        "m cycle mute\n"
+        "LEFT seek -5\n"
+        "RIGHT seek 5\n"
+    )
+    input_conf_file.write_text(input_conf_content)
+
+    # 3. Position tracking Lua script
+    tracker_file = RAM_DIR / "last_pos.txt"
+    if tracker_file.exists():
+        try:
+            tracker_file.unlink()
+        except Exception:
+            pass
+
+    tracker_lua = RAM_DIR / "tracker.lua"
+    lua_code = f"""
+local current_pos = {m3u_start_idx}
+mp.register_event("start-file", function()
+    local pos = mp.get_property_number("playlist-pos", -1)
+    if pos and pos >= 0 then
+        current_pos = pos
+        local f = io.open([[{str(tracker_file)}]], "w")
+        if f then
+            f:write(tostring(current_pos))
+            f:close()
+        end
+    end
+end)
+"""
+    tracker_lua.write_text(lua_code)
 
     term_size = shutil.get_terminal_size((80, 24))
     cols = term_size.columns
     rows = term_size.lines
-
-    from tikcli.config import DEFAULT_VO_DRIVER
-    selected_driver = (vo_driver or DEFAULT_VO_DRIVER or "tct").lower()
+    pixel_w, pixel_h = get_terminal_pixel_size()
 
     cmd = [
         MPV_PATH,
-        "--no-config",             # Ignore ~/.config/mpv/mpv.conf (e.g. pseudo-gui)
-        "--terminal=yes",          # Force terminal display
-        "--force-window=no",       # Never open external X11 / Wayland window
-        "--keep-open=no",          # Exit when playback completes
-        "--term-osd-bar=yes",      # Show terminal seekbar
-        "--msg-level=all=no",      # Suppress verbose terminal log spam
-        "--term-title=" + (f"tik-cli: {title[:40]}" if title else "tik-cli playback"),
+        "--no-config",
+        "--terminal=yes",
+        "--force-window=no",
+        "--loop-file=inf",             # Loop current video indefinitely!
+        "--loop-playlist=inf",         # Continuous playlist navigation
+        f"--playlist={m3u_file}",
+        f"--playlist-start={m3u_start_idx}",
+        f"--input-conf={input_conf_file}",
+        f"--script={tracker_lua}",
+        "--osd-playing-msg=📱 ${media-title} [j/↓: Next, k/↑: Prev, Space: Pause, ESC/q: Exit]",
+        "--term-osd-bar=yes",
+        "--msg-level=all=no",
+        "--http-header-fields-append=Referer: https://www.tiktok.com/",
+        "--http-header-fields-append=User-Agent: Mozilla/5.0 (X11; Linux x86_64)",
     ]
 
     if selected_driver == "sixel":
-        # Sixel graphics with explicit dimension overrides to prevent 320x240 fallback
+        # Sixel graphics with high-res window dimensions (e.g. 1536x834 on Foot)
         cmd.extend([
             "--vo=sixel",
             f"--vo-sixel-cols={cols}",
             f"--vo-sixel-rows={rows}",
-            f"--vo-sixel-width={cols * 10}",
-            f"--vo-sixel-height={rows * 20}",
+            f"--vo-sixel-width={pixel_w}",
+            f"--vo-sixel-height={pixel_h}",
             "--profile=sw-fast",
             "--vo-sixel-fixedpalette=yes",
+            "--vo-sixel-buffered=yes",
         ])
     else:
-        # TrueColor Text Terminal (tct) - Scales to full terminal character grid
+        # TrueColor text terminal fallback
         cmd.extend([
             "--vo=tct",
             f"--vo-tct-width={cols}",
@@ -141,35 +258,52 @@ def play_video_in_terminal(
             "--vo-tct-256=no",
         ])
 
-    # Custom HTTP headers for TikTok CDN video streams
-    if extra_headers:
-        header_str = ",".join([f"{k}: {v}" for k, v in extra_headers.items()])
-        cmd.append(f"--http-header-fields={header_str}")
-    else:
-        cmd.append("--http-header-fields=Referer: https://www.tiktok.com/,User-Agent: Mozilla/5.0 (X11; Linux x86_64)")
-
-    cmd.append(video_url)
-
-    # Save alternate screen buffer and show cursor for interactive mpv controls
+    # Save alternate screen buffer and show cursor
     sys.stdout.write("\033[?1049h\033[2J\033[H\033[?25h")
     sys.stdout.flush()
 
+    last_index = start_index
     try:
         proc = subprocess.run(cmd)
-        success = (proc.returncode == 0)
-        msg = "Playback finished." if success else f"mpv exited with code {proc.returncode}."
+        if tracker_file.exists():
+            try:
+                val = int(tracker_file.read_text().strip())
+                if 0 <= val < len(valid_entries):
+                    last_index = valid_entries[val][0]
+            except Exception:
+                pass
+        msg = "Returned to menu."
     except KeyboardInterrupt:
-        success = True
-        msg = "Playback stopped by user."
+        if tracker_file.exists():
+            try:
+                val = int(tracker_file.read_text().strip())
+                if 0 <= val < len(valid_entries):
+                    last_index = valid_entries[val][0]
+            except Exception:
+                pass
+        msg = "Playback stopped."
     except Exception as e:
-        success = False
-        msg = f"Failed to play video: {e}"
+        msg = f"Playback error: {e}"
     finally:
-        # Restore alternate screen buffer, clear screen, and return cleanly to TUI
         sys.stdout.write("\033[?1049l\033[2J\033[H\033[?25l")
         sys.stdout.flush()
 
-    return success, msg
+    return last_index, msg
+
+
+def play_video_in_terminal(
+    video_url: str,
+    title: str = "",
+    extra_headers: Optional[Dict[str, str]] = None,
+    vo_driver: Optional[str] = None
+) -> Tuple[bool, str]:
+    """Single video playback helper (loops continuously until ESC/q)."""
+    if not video_url:
+        return False, "No video URL provided."
+    single_item = [{"play_url": video_url, "title": title, "author_id": "tiktok", "duration": 0}]
+    _, msg = play_feed_in_terminal(single_item, start_index=0, vo_driver=vo_driver)
+    return True, msg
+
 
 
 
