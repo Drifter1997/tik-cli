@@ -43,7 +43,7 @@ def fetch_bytes_in_ram(url: str, timeout: int = 15) -> Optional[bytes]:
 
 
 def get_inline_thumbnail(image_url: str, max_width: int = THUMB_MAX_WIDTH, max_height: int = THUMB_MAX_HEIGHT) -> str:
-    """Generate ANSI terminal thumbnail using chafa, cached in RAM memory."""
+    """Generate crisp TrueColor ANSI terminal thumbnail using chafa, cached in RAM."""
     if not image_url:
         return ""
 
@@ -56,13 +56,16 @@ def get_inline_thumbnail(image_url: str, max_width: int = THUMB_MAX_WIDTH, max_h
         return ""
 
     try:
-        # Run chafa with input piped via stdin to keep 100% in RAM
+        # Run chafa with 24-bit TrueColor, sharp block characters, and no dither artifacts
         result = subprocess.run(
             [
                 CHAFA_PATH,
                 "-s", f"{max_width}x{max_height}",
                 "--format=symbols",
-                "--colors=256",
+                "-c", "full",
+                "--symbols=vhalf+hhalf+block+border",
+                "--dither=none",
+                "--polite=on",
                 "-"
             ],
             input=raw_bytes,
@@ -70,7 +73,10 @@ def get_inline_thumbnail(image_url: str, max_width: int = THUMB_MAX_WIDTH, max_h
             timeout=8
         )
         if result.returncode == 0 and result.stdout:
-            rendered = result.stdout.decode("utf-8", errors="replace").rstrip("\n")
+            raw_lines = result.stdout.decode("utf-8", errors="replace").splitlines()
+            # Ensure each line terminates with ANSI reset to prevent color bleeding
+            clean_lines = [line.rstrip() + "\033[0m" for line in raw_lines if line.strip()]
+            rendered = "\n".join(clean_lines)
             _THUMBNAIL_CACHE[cache_key] = rendered
             return rendered
     except Exception:
@@ -79,11 +85,16 @@ def get_inline_thumbnail(image_url: str, max_width: int = THUMB_MAX_WIDTH, max_h
     return ""
 
 
-def play_video_in_terminal(video_url: str, title: str = "", extra_headers: Optional[Dict[str, str]] = None) -> Tuple[bool, str]:
+def play_video_in_terminal(
+    video_url: str,
+    title: str = "",
+    extra_headers: Optional[Dict[str, str]] = None,
+    vo_driver: Optional[str] = None
+) -> Tuple[bool, str]:
     """
-    Play video directly inside the terminal cells using mpv's sixel or tct (true-color) video driver.
+    Play video directly inside terminal cells, scaling to full terminal height and width.
     Ensures ZERO external popup windows.
-    Zero disk clutter: streams directly over HTTPS via RAM.
+    Eliminates the 320x240 tiny video bug by passing explicit terminal dimensions.
     """
     if not video_url:
         return False, "No video URL provided."
@@ -91,16 +102,46 @@ def play_video_in_terminal(video_url: str, title: str = "", extra_headers: Optio
     if not shutil.which(MPV_PATH) and not Path(MPV_PATH).exists():
         return False, f"mpv player not found at '{MPV_PATH}'."
 
+    term_size = shutil.get_terminal_size((80, 24))
+    cols = term_size.columns
+    rows = term_size.lines
+
+    from tikcli.config import DEFAULT_VO_DRIVER
+    selected_driver = (vo_driver or DEFAULT_VO_DRIVER or "tct").lower()
+
     cmd = [
         MPV_PATH,
-        "--vo=sixel,tct",         # Sixel if terminal supports it (e.g. foot), truecolor ANSI block fallback
-        "--keep-open=no",          # Exit when playback finishes
-        "--term-osd-bar",          # Show OSD seek bar in terminal
-        "--msg-level=all=no",      # Suppress verbose log spam in terminal
+        "--no-config",             # Ignore ~/.config/mpv/mpv.conf (e.g. pseudo-gui)
+        "--terminal=yes",          # Force terminal display
+        "--force-window=no",       # Never open external X11 / Wayland window
+        "--keep-open=no",          # Exit when playback completes
+        "--term-osd-bar=yes",      # Show terminal seekbar
+        "--msg-level=all=no",      # Suppress verbose terminal log spam
         "--term-title=" + (f"tik-cli: {title[:40]}" if title else "tik-cli playback"),
     ]
 
-    # Add custom HTTP headers if needed for direct CDN streams
+    if selected_driver == "sixel":
+        # Sixel graphics with explicit dimension overrides to prevent 320x240 fallback
+        cmd.extend([
+            "--vo=sixel",
+            f"--vo-sixel-cols={cols}",
+            f"--vo-sixel-rows={rows}",
+            f"--vo-sixel-width={cols * 10}",
+            f"--vo-sixel-height={rows * 20}",
+            "--profile=sw-fast",
+            "--vo-sixel-fixedpalette=yes",
+        ])
+    else:
+        # TrueColor Text Terminal (tct) - Scales to full terminal character grid
+        cmd.extend([
+            "--vo=tct",
+            f"--vo-tct-width={cols}",
+            f"--vo-tct-height={rows}",
+            "--vo-tct-algo=half-blocks",
+            "--vo-tct-256=no",
+        ])
+
+    # Custom HTTP headers for TikTok CDN video streams
     if extra_headers:
         header_str = ",".join([f"{k}: {v}" for k, v in extra_headers.items()])
         cmd.append(f"--http-header-fields={header_str}")
@@ -109,12 +150,11 @@ def play_video_in_terminal(video_url: str, title: str = "", extra_headers: Optio
 
     cmd.append(video_url)
 
-    # Save alternate screen buffer and show cursor
+    # Save alternate screen buffer and show cursor for interactive mpv controls
     sys.stdout.write("\033[?1049h\033[2J\033[H\033[?25h")
     sys.stdout.flush()
 
     try:
-        # Run mpv synchronously with inherited terminal stdio for interactive controls (Space, q, arrows)
         proc = subprocess.run(cmd)
         success = (proc.returncode == 0)
         msg = "Playback finished." if success else f"mpv exited with code {proc.returncode}."
@@ -125,11 +165,12 @@ def play_video_in_terminal(video_url: str, title: str = "", extra_headers: Optio
         success = False
         msg = f"Failed to play video: {e}"
     finally:
-        # Restore alternate screen and clear terminal back for TUI
+        # Restore alternate screen buffer, clear screen, and return cleanly to TUI
         sys.stdout.write("\033[?1049l\033[2J\033[H\033[?25l")
         sys.stdout.flush()
 
     return success, msg
+
 
 
 def play_audio_in_terminal(audio_url: str, title: str = "") -> Tuple[bool, str]:

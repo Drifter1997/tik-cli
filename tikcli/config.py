@@ -48,3 +48,4 @@ YTDLP_PATH = shutil.which("yt-dlp") or "yt-dlp"
 THUMB_MAX_WIDTH = 32
 THUMB_MAX_HEIGHT = 14
 DEFAULT_REGION = "US"
+DEFAULT_VO_DRIVER = os.environ.get("TIKCLI_VO", "tct")

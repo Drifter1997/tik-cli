@@ -15,6 +15,7 @@ from tikcli.config import (
     RAM_DIR,
     THUMB_MAX_WIDTH,
     THUMB_MAX_HEIGHT,
+    DEFAULT_VO_DRIVER,
 )
 from tikcli.client import TikTokClient
 from tikcli.media import (
@@ -248,6 +249,10 @@ class TerminalUI:
         # Cached thumbnails
         self._thumbnail_cache: Dict[str, List[str]] = {}
 
+        # Video driver selection (tct or sixel)
+        self.vo_driver = DEFAULT_VO_DRIVER
+        self.force_clear = True
+
         atexit.register(self._cleanup_terminal)
 
     def _cleanup_terminal(self):
@@ -330,6 +335,9 @@ class TerminalUI:
         lines = term_size.lines
 
         buf = []
+        if getattr(self, "force_clear", False):
+            buf.append("\033[2J")
+            self.force_clear = False
         buf.append("\033[H")  # Move to top-left
 
         # 1. Header
@@ -391,8 +399,9 @@ class TerminalUI:
         combined = []
         for i in range(height):
             l_str = left_lines[i] if i < len(left_lines) else " " * left_w
-            r_str = right_lines[i] if i < len(right_lines) else ""
-            combined.append(f"{l_str} {GRAY}│{RESET} {r_str}\n")
+            r_str = right_lines[i] if i < len(right_lines) else " " * right_w
+            # Clear to end of line (\033[K) to avoid ghosting artifacts
+            combined.append(f"{l_str} {GRAY}│{RESET} {r_str}\033[K\n")
 
         return combined
 
@@ -446,15 +455,15 @@ class TerminalUI:
     def render_preview(self, video: Optional[Dict[str, Any]], width: int, height: int) -> List[str]:
         lines = []
         if not video:
-            lines.append(f"{DIM}Select a video to preview.{RESET}")
+            lines.append(f"{DIM}Select a video to preview.{RESET}".ljust(width))
             while len(lines) < height:
                 lines.append(" " * width)
             return lines
 
         # 1. Inline Thumbnail via chafa in RAM
         cover_url = video.get("cover_url", "")
-        thumb_h = min(10, max(6, height - 12))
-        thumb_w = min(width - 2, 28)
+        thumb_h = min(14, max(8, height - 12))
+        thumb_w = min(width - 4, 30)
 
         if cover_url:
             cache_key = f"{cover_url}:{thumb_w}x{thumb_h}"
@@ -463,15 +472,20 @@ class TerminalUI:
                 self._thumbnail_cache[cache_key] = rendered.split("\n") if rendered else []
             thumb_lines = self._thumbnail_cache[cache_key]
             for t_line in thumb_lines[:thumb_h]:
-                lines.append(t_line[:width])
+                vis_len = len(strip_ansi(t_line))
+                pad = " " * max(0, width - vis_len)
+                # Append intact ANSI line with reset and spaces - NEVER slice raw ANSI escape string
+                lines.append(f"{t_line}{RESET}{pad}")
         else:
-            lines.append(f"{DIM}[No thumbnail]{RESET}")
+            lines.append(f"{DIM}[No thumbnail available]{RESET}".ljust(width))
 
-        lines.append("")
+        lines.append(" " * width)
 
         # 2. Author and stats
         author_name = video.get("author_name") or video.get("author_id", "Creator")
-        lines.append(f"{BOLD}{WHITE}{author_name}{RESET} {CYAN}@{video.get('author_id')}{RESET}")
+        author_line = f"{BOLD}{WHITE}{author_name}{RESET} {CYAN}@{video.get('author_id')}{RESET}"
+        pad = " " * max(0, width - len(strip_ansi(author_line)))
+        lines.append(f"{author_line}{pad}")
 
         stats_row = (
             f"{RED}♥ {format_count(video.get('likes', 0))}{RESET}   "
@@ -479,19 +493,24 @@ class TerminalUI:
             f"{YELLOW}💬 {format_count(video.get('comments', 0))}{RESET}   "
             f"{DIM}⏱ {format_duration(video.get('duration', 0))}{RESET}"
         )
-        lines.append(stats_row)
+        pad = " " * max(0, width - len(strip_ansi(stats_row)))
+        lines.append(f"{stats_row}{pad}")
 
         # 3. Title / Caption
-        title = video.get("title", "")
-        lines.append(f"{DIM}Caption:{RESET}")
-        wrapped = [title[j:j + width - 2] for j in range(0, min(150, len(title)), width - 2)]
+        title = video.get("title", "").strip()
+        lines.append(f"{DIM}Caption:{RESET}".ljust(width))
+        wrapped = [title[j:j + width - 4] for j in range(0, min(160, len(title)), max(1, width - 4))]
         for w in wrapped[:3]:
-            lines.append(f"  {LIGHT_GRAY}{w}{RESET}")
+            cap_line = f"  {LIGHT_GRAY}{w}{RESET}"
+            pad = " " * max(0, width - len(strip_ansi(cap_line)))
+            lines.append(f"{cap_line}{pad}")
 
         # 4. Music Track
-        music = video.get("music_title", "")
+        music = video.get("music_title", "").strip()
         if music:
-            lines.append(f"{DIM}Sound:{RESET} 🎵 {music[:width - 12]}")
+            music_line = f"{DIM}Sound:{RESET} 🎵 {music[:max(10, width - 12)]}"
+            pad = " " * max(0, width - len(strip_ansi(music_line)))
+            lines.append(f"{music_line}{pad}")
 
         while len(lines) < height:
             lines.append(" " * width)
@@ -655,13 +674,20 @@ class TerminalUI:
             elif cmd.startswith("user ") or cmd.startswith("creator "):
                 user = cmd.split(" ", 1)[1]
                 self.load_creator(user)
+            elif cmd.startswith("vo "):
+                driver = cmd.split(" ", 1)[1].strip().lower()
+                if driver in ("tct", "sixel"):
+                    self.vo_driver = driver
+                    self.set_status(f"Video driver set to '{driver.upper()}'.", GREEN)
+                else:
+                    self.set_status("Invalid driver. Use ':vo tct' or ':vo sixel'.", RED)
             elif cmd == "login":
                 self.start_login_flow()
             elif cmd == "logout":
                 self.client.logout()
                 self.set_status("Logged out. Switched to Guest Mode.", YELLOW)
             elif cmd == "help":
-                self.set_status("Keys: Enter=play, :d=download, :m=audio, /=search, :login, :logout, :q=quit", CYAN)
+                self.set_status("Keys: Enter=play, :d=download, :m=audio, :vo tct|sixel, /=search, :q=quit", CYAN)
             elif cmd:
                 self.set_status(f"Unknown command: :{cmd}", RED)
 
@@ -709,9 +735,16 @@ class TerminalUI:
             self.set_status("No playable URL for this video.", RED)
             return
 
-        self.set_status(f"Playing in terminal: {video.get('title', '')[:30]}...", CYAN)
-        success, msg = play_video_in_terminal(play_url, title=video.get("title", ""))
+        self.set_status(f"Playing in terminal ({self.vo_driver.upper()}): {video.get('title', '')[:25]}...", CYAN)
+        self.draw()
+        success, msg = play_video_in_terminal(
+            play_url,
+            title=video.get("title", ""),
+            vo_driver=self.vo_driver
+        )
+        self.force_clear = True
         self.set_status(msg, GREEN if success else RED)
+
 
     def action_download_selected(self):
         """Explicitly download the selected video (:d)."""
