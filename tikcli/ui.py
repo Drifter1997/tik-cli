@@ -475,11 +475,18 @@ class TerminalUI:
                 rendered = get_inline_thumbnail(cover_url, max_width=thumb_w, max_height=thumb_h)
                 self._thumbnail_cache[cache_key] = rendered.split("\n") if rendered else []
             thumb_lines = self._thumbnail_cache[cache_key]
-            for t_line in thumb_lines[:thumb_h]:
-                vis_len = len(strip_ansi(t_line))
+            if thumb_lines:
+                for t_line in thumb_lines[:thumb_h]:
+                    vis_len = len(strip_ansi(t_line))
+                    margin_left = max(0, (width - vis_len) // 2)
+                    margin_right = max(0, width - vis_len - margin_left)
+                    lines.append(f"{' ' * margin_left}{t_line}{RESET}{' ' * margin_right}")
+            else:
+                placeholder = f"{DIM}[Thumbnail unavailable]{RESET}"
+                vis_len = len(strip_ansi(placeholder))
                 margin_left = max(0, (width - vis_len) // 2)
                 margin_right = max(0, width - vis_len - margin_left)
-                lines.append(f"{' ' * margin_left}{t_line}{RESET}{' ' * margin_right}")
+                lines.append(f"{' ' * margin_left}{placeholder}{' ' * margin_right}")
         else:
             no_thumb = f"{DIM}[No thumbnail available]{RESET}"
             vis_len = len(strip_ansi(no_thumb))

@@ -54,10 +54,8 @@ def get_default_vo_driver() -> str:
     env_driver = os.environ.get("TIKCLI_VO")
     if env_driver:
         return env_driver.lower()
-    term = os.environ.get("TERM", "").lower()
-    # Default to Sixel on Foot / Sway for crystal-clear high-definition video
-    if "foot" in term or os.environ.get("SWAYSOCK"):
-        return "sixel"
+    # Default to 24-bit TrueColor (tct) for 100% accurate colors with zero banding or dithering grains.
+    # Users can toggle to high-res pixel mode at any time using ':vo sixel' or ':vo'.
     return "tct"
 
 

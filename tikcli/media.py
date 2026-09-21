@@ -157,7 +157,7 @@ def get_inline_thumbnail(image_url: str, max_width: int = THUMB_MAX_WIDTH, max_h
             # Strip cursor hide/show sequences (\x1b[?25l / \x1b[?25h) so they don't break row alignments
             raw_text = re.sub(r'\x1b\[\?[0-9]+[hl]', '', raw_text)
             raw_lines = raw_text.splitlines()
-            clean_lines = [line.rstrip() + "\033[0m" for line in raw_lines if line.strip()]
+            clean_lines = [line.rstrip("\r\n") + "\033[0m" for line in raw_lines if line.strip()]
             rendered = "\n".join(clean_lines)
             _THUMBNAIL_CACHE[cache_key] = rendered
             return rendered
@@ -299,6 +299,7 @@ end)
             "--vo-sixel-fixedpalette=no",   # Dynamic adaptive palette: eliminates Windows 98 8-bit VGA look!
             "--vo-sixel-threshold=-1",      # Per-frame palette optimization for maximum color fidelity
             "--vo-sixel-reqcolors=256",     # Full 256 dynamic colors per frame
+            "--vo-sixel-dither=none",       # Eradicate all dithering grain noise!
             "--vo-sixel-buffered=yes",
         ])
     else:
