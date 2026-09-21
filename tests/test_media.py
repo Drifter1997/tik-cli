@@ -48,3 +48,18 @@ def test_strip_ansi_private_modes():
     assert strip_ansi(raw) == "Text"
 
 
+def test_view_thumbnail_empty_url():
+    from tikcli.media import view_thumbnail
+    ok, msg = view_thumbnail("")
+    assert not ok
+    assert "No thumbnail URL" in msg
+
+
+def test_play_feed_mpv_mode_empty():
+    from tikcli.media import play_feed
+    idx, msg = play_feed([], start_index=0, vo_driver="mpv")
+    assert idx == 0
+    assert "No videos" in msg
+
+
+

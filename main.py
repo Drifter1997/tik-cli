@@ -12,6 +12,7 @@ def main():
         description="tik-cli: Minimal TikTok CLI/TUI with in-terminal video playback and RAM streaming."
     )
     parser.add_argument("--play", type=str, help="Directly play a TikTok video URL in the terminal")
+    parser.add_argument("--vo", choices=["sixel", "mpv"], help="Video output mode: 'sixel' (terminal) or 'mpv' (external window)")
     parser.add_argument("--user", type=str, help="Launch TUI directly on a specific creator's profile (@username)")
     parser.add_argument("--session", type=str, help="Authenticate directly with a TikTok sessionid cookie")
     parser.add_argument("--ttwid", type=str, help="Optional ttwid cookie for authentication")
@@ -53,7 +54,7 @@ def main():
             print("Dry run complete. Exiting.")
             return
 
-        play_video_in_terminal(video["play_url"], title=video.get("title", ""))
+        play_video_in_terminal(video["play_url"], title=video.get("title", ""), vo_driver=args.vo)
         return
 
     if args.user and args.dry_run:
@@ -66,6 +67,8 @@ def main():
 
     # Default: launch interactive TUI
     ui = TerminalUI(client)
+    if args.vo:
+        ui.vo_driver = args.vo
     if args.user:
         ui.load_creator(args.user)
     ui.run()

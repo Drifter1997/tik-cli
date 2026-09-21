@@ -23,5 +23,5 @@ def test_ram_dir_writable():
 def test_get_default_vo_driver():
     from tikcli.config import get_default_vo_driver
     driver = get_default_vo_driver()
-    assert driver in ("sixel", "tct")
+    assert driver in ("sixel", "mpv")
 

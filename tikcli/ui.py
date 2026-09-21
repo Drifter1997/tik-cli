@@ -19,10 +19,11 @@ from tikcli.config import (
 )
 from tikcli.client import TikTokClient
 from tikcli.media import (
-    get_inline_thumbnail,
+    play_feed,
     play_feed_in_terminal,
     play_video_in_terminal,
     play_audio_in_terminal,
+    view_thumbnail,
     download_video,
     download_audio,
 )
@@ -459,73 +460,96 @@ class TerminalUI:
     def render_preview(self, video: Optional[Dict[str, Any]], width: int, height: int) -> List[str]:
         lines = []
         if not video:
-            lines.append(f"{DIM}Select a video to preview.{RESET}".ljust(width))
+            empty_msg = f"{DIM}Select a video to view details.{RESET}"
+            lines.append(f"{' ' * max(0, (width - len(strip_ansi(empty_msg))) // 2)}{empty_msg}")
             while len(lines) < height:
                 lines.append(" " * width)
             return lines
 
-        # 1. Inline Thumbnail via chafa in RAM
-        cover_url = video.get("cover_url", "")
-        thumb_h = max(12, min(26, height - 7))
-        thumb_w = min(width - 2, 48)
+        def add_line(text: str = ""):
+            vis = len(strip_ansi(text))
+            pad = " " * max(0, width - vis)
+            lines.append(f"{text}{pad}")
 
-        if cover_url:
-            cache_key = f"{cover_url}:{thumb_w}x{thumb_h}"
-            if cache_key not in self._thumbnail_cache:
-                rendered = get_inline_thumbnail(cover_url, max_width=thumb_w, max_height=thumb_h)
-                self._thumbnail_cache[cache_key] = rendered.split("\n") if rendered else []
-            thumb_lines = self._thumbnail_cache[cache_key]
-            if thumb_lines:
-                for t_line in thumb_lines[:thumb_h]:
-                    vis_len = len(strip_ansi(t_line))
-                    margin_left = max(0, (width - vis_len) // 2)
-                    margin_right = max(0, width - vis_len - margin_left)
-                    lines.append(f"{' ' * margin_left}{t_line}{RESET}{' ' * margin_right}")
-            else:
-                placeholder = f"{DIM}[Thumbnail unavailable]{RESET}"
-                vis_len = len(strip_ansi(placeholder))
-                margin_left = max(0, (width - vis_len) // 2)
-                margin_right = max(0, width - vis_len - margin_left)
-                lines.append(f"{' ' * margin_left}{placeholder}{' ' * margin_right}")
-        else:
-            no_thumb = f"{DIM}[No thumbnail available]{RESET}"
-            vis_len = len(strip_ansi(no_thumb))
-            margin_left = max(0, (width - vis_len) // 2)
-            margin_right = max(0, width - vis_len - margin_left)
-            lines.append(f"{' ' * margin_left}{no_thumb}{' ' * margin_right}")
+        add_line()
+        add_line(f"  {BOLD}{CYAN}─── VIDEO DETAILS ──────────────────────────────────────────{RESET}"[:width])
+        add_line()
 
-        lines.append(" " * width)
-
-        # 2. Author and stats
+        # Creator Info
         author_name = video.get("author_name") or video.get("author_id", "Creator")
-        author_line = f"  {BOLD}{WHITE}{author_name}{RESET} {CYAN}@{video.get('author_id')}{RESET}"
-        pad = " " * max(0, width - len(strip_ansi(author_line)))
-        lines.append(f"{author_line}{pad}")
+        author_id = video.get("author_id", "unknown")
+        add_line(f"  👤 {BOLD}{WHITE}{author_name}{RESET}  {CYAN}@{author_id}{RESET}")
+        add_line()
 
-        stats_row = (
-            f"  {RED}♥ {format_count(video.get('likes', 0))}{RESET}   "
-            f"{CYAN}▶ {format_count(video.get('views', 0))}{RESET}   "
-            f"{YELLOW}💬 {format_count(video.get('comments', 0))}{RESET}   "
-            f"{DIM}⏱ {format_duration(video.get('duration', 0))}{RESET}"
-        )
-        pad = " " * max(0, width - len(strip_ansi(stats_row)))
-        lines.append(f"{stats_row}{pad}")
+        # Title & Caption (Word-wrapped)
+        title = (video.get("title") or "No caption provided").strip()
+        add_line(f"  📝 {BOLD}{LIGHT_GRAY}Caption:{RESET}")
 
-        # 3. Title / Caption
-        title = video.get("title", "").strip()
-        lines.append(f"  {DIM}Caption:{RESET}".ljust(width))
-        wrapped = [title[j:j + width - 6] for j in range(0, min(160, len(title)), max(1, width - 6))]
-        for w in wrapped[:3]:
-            cap_line = f"    {LIGHT_GRAY}{w}{RESET}"
-            pad = " " * max(0, width - len(strip_ansi(cap_line)))
-            lines.append(f"{cap_line}{pad}")
+        def color_tags(text_line: str) -> str:
+            return re.sub(r'(#[a-zA-Z0-9_\u4e00-\u9fa5]+)', f'{CYAN}\\1{RESET}{LIGHT_GRAY}', text_line)
 
-        # 4. Music Track
-        music = video.get("music_title", "").strip()
+        max_wrap = max(20, width - 6)
+        words = title.split(" ")
+        curr_line = ""
+        wrap_lines = []
+        for w in words:
+            if not curr_line:
+                curr_line = w
+            elif len(curr_line) + 1 + len(w) <= max_wrap:
+                curr_line += " " + w
+            else:
+                wrap_lines.append(curr_line)
+                curr_line = w
+        if curr_line:
+            wrap_lines.append(curr_line)
+
+        for w_line in wrap_lines[:5]:
+            add_line(f"    {LIGHT_GRAY}{color_tags(w_line)}{RESET}")
+        add_line()
+
+        # Engagement Statistics Card
+        add_line(f"  📊 {BOLD}{LIGHT_GRAY}Engagement Metrics:{RESET}")
+        likes_str = format_count(video.get("likes", 0))
+        views_str = format_count(video.get("views", 0))
+        comments_str = format_count(video.get("comments", 0))
+        shares_str = format_count(video.get("shares", 0))
+        dur_str = format_duration(video.get("duration", 0))
+
+        stat_line1 = f"    {RED}♥ {likes_str} Likes{RESET}    {CYAN}▶ {views_str} Views{RESET}"
+        stat_line2 = f"    {YELLOW}💬 {comments_str} Comments{RESET}  {MAGENTA}↗ {shares_str} Shares{RESET}  {DIM}⏱ {dur_str}{RESET}"
+        add_line(stat_line1)
+        add_line(stat_line2)
+        add_line()
+
+        # Soundtrack Info
+        music = (video.get("music_title") or "").strip()
         if music:
-            music_line = f"  {DIM}Sound:{RESET} 🎵 {music[:max(10, width - 14)]}"
-            pad = " " * max(0, width - len(strip_ansi(music_line)))
-            lines.append(f"{music_line}{pad}")
+            add_line(f"  🎵 {BOLD}{LIGHT_GRAY}Soundtrack:{RESET}")
+            music_author = video.get("music_author", "").strip()
+            music_desc = f"{music}"
+            if music_author and music_author not in music:
+                music_desc += f" — {music_author}"
+            add_line(f"    {DIM}🎵 {music_desc[:max(15, width - 10)]}{RESET}")
+            add_line()
+
+        # Playback Settings & Info Card
+        mode_desc = (
+            f"{GREEN}{BOLD}SIXEL (In-Terminal){RESET} {DIM}[j/k: Feed Scroll]{RESET}"
+            if self.vo_driver == "sixel"
+            else f"{CYAN}{BOLD}MPV (External Window){RESET} {DIM}[GPU TrueColor, j/k: Feed Scroll]{RESET}"
+        )
+        add_line(f"  ⚙️  {BOLD}{LIGHT_GRAY}Playback Mode:{RESET}")
+        add_line(f"    {mode_desc}")
+        add_line()
+
+        # Quick Action Shortcuts Card
+        add_line(f"  {BOLD}{CYAN}─── QUICK ACTIONS ──────────────────────────────────────────{RESET}"[:width])
+        add_line(f"    {BOLD}[Enter]{RESET}  Watch Video (Looping + Feed Scrolling)")
+        toggle_target = "External MPV Window" if self.vo_driver == "sixel" else "In-Terminal SIXEL"
+        add_line(f"    {BOLD}[v]{RESET}      Switch Mode to {toggle_target}")
+        add_line(f"    {BOLD}[t]{RESET}      Open Original HD Cover Photo")
+        add_line(f"    {BOLD}[:d]{RESET}     Download Video MP4 to ~/Downloads/")
+        add_line(f"    {BOLD}[:m]{RESET}     Play Audio Soundtrack Only")
 
         while len(lines) < height:
             lines.append(" " * width)
@@ -569,13 +593,15 @@ class TerminalUI:
             lines.append(f"{prompt_str}\n")
         else:
             # Controls and Dynamic Status bar
+            driver_tag = f"{GREEN}SIXEL{RESET}" if self.vo_driver == "sixel" else f"{CYAN}MPV Window{RESET}"
             shortcuts = (
-                f"{BOLD}[Enter]{RESET} Watch ({self.vo_driver.upper()})  "
-                f"{BOLD}[:vo]{RESET} Toggle VO  "
+                f"{BOLD}[Enter]{RESET} Watch ({driver_tag})  "
+                f"{BOLD}[v]{RESET} Mode  "
+                f"{BOLD}[t]{RESET} Cover  "
                 f"{BOLD}[:d]{RESET} Download  "
                 f"{BOLD}[:m]{RESET} Audio  "
-                f"{BOLD}[/]{RESET} Search/@  "
-                f"{BOLD}[Tab]{RESET} Mode  "
+                f"{BOLD}[/]{RESET} Search  "
+                f"{BOLD}[Tab]{RESET} Tabs  "
                 f"{BOLD}[:q]{RESET} Quit"
             )
             status = f"{self.status_color}{self.status_message}{RESET}"
@@ -630,6 +656,10 @@ class TerminalUI:
             self.mode = "creator"
         elif key in ("3",):
             self.mode = "dms"
+        elif key in ("v", "w"):
+            self.action_toggle_vo()
+        elif key == "t":
+            self.action_view_thumbnail()
         elif key == "ENTER":
             self.action_play_selected()
         elif key == "r":
@@ -690,25 +720,28 @@ class TerminalUI:
             elif cmd.startswith("user ") or cmd.startswith("creator "):
                 user = cmd.split(" ", 1)[1]
                 self.load_creator(user)
-            elif cmd == "vo" or cmd.startswith("vo "):
+            elif cmd in ("vo", "v"):
+                self.action_toggle_vo()
+            elif cmd.startswith("vo "):
                 parts = cmd.split(" ", 1)
-                if len(parts) == 2:
-                    driver = parts[1].strip().lower()
+                driver = parts[1].strip().lower()
+                if driver in ("mpv", "window", "external", "gui"):
+                    self.vo_driver = "mpv"
+                    self.set_status("Video output mode: External MPV Window (GPU TrueColor).", GREEN)
+                elif driver == "sixel":
+                    self.vo_driver = "sixel"
+                    self.set_status("Video output mode: In-Terminal SIXEL.", GREEN)
                 else:
-                    driver = "tct" if self.vo_driver == "sixel" else "sixel"
-                if driver in ("tct", "sixel"):
-                    self.vo_driver = driver
-                    desc = "24-bit TrueColor" if driver == "tct" else "Sixel High-Res"
-                    self.set_status(f"Video driver switched to {driver.upper()} ({desc}).", GREEN)
-                else:
-                    self.set_status("Invalid driver. Use ':vo tct' or ':vo sixel'.", RED)
+                    self.set_status("Invalid mode. Use ':vo sixel' or ':vo mpv'.", RED)
+            elif cmd in ("thumb", "thumbnail", "cover"):
+                self.action_view_thumbnail()
             elif cmd == "login":
                 self.start_login_flow()
             elif cmd == "logout":
                 self.client.logout()
                 self.set_status("Logged out. Switched to Guest Mode.", YELLOW)
             elif cmd == "help":
-                self.set_status("Keys: Enter=play, :vo=toggle sixel/tct, :d=download, :m=audio, /=search, :q=quit", CYAN)
+                self.set_status("Keys: Enter=watch, v=toggle sixel/mpv, t=cover, :d=download, :m=audio, /=search, :q=quit", CYAN)
             elif cmd:
                 self.set_status(f"Unknown command: :{cmd}", RED)
 
@@ -744,8 +777,27 @@ class TerminalUI:
             return items[idx]
         return None
 
+    def action_toggle_vo(self):
+        self.vo_driver = "mpv" if self.vo_driver == "sixel" else "sixel"
+        mode_desc = "External MPV Window (GPU TrueColor)" if self.vo_driver == "mpv" else "In-Terminal SIXEL"
+        self.set_status(f"Video mode switched to: {mode_desc}", GREEN)
+
+    def action_view_thumbnail(self):
+        video = self.get_selected_video()
+        if not video:
+            self.set_status("No video selected.", RED)
+            return
+        cover_url = video.get("cover_url", "")
+        if not cover_url:
+            self.set_status("No cover URL available for this video.", RED)
+            return
+        self.set_status("Opening HD cover thumbnail in image viewer...", CYAN)
+        self.draw()
+        ok, msg = view_thumbnail(cover_url, title=video.get("title", ""))
+        self.set_status(msg, GREEN if ok else RED)
+
     def action_play_selected(self):
-        """Play feed in terminal with looping, next/prev scrolling, and pos tracking."""
+        """Play feed with looping, next/prev scrolling, and pos tracking (SIXEL or MPV window)."""
         items = self.feed_items if self.mode == "feed" else self.creator_items
         idx = self.feed_index if self.mode == "feed" else self.creator_index
         if not items or not (0 <= idx < len(items)):
@@ -754,10 +806,11 @@ class TerminalUI:
 
         video = items[idx]
         author = video.get("author_id", "creator")
-        self.set_status(f"Feed playback ({self.vo_driver.upper()}): @{author} [j/↓: Next, k/↑: Prev, ESC/q: Exit]", CYAN)
+        mode_label = "SIXEL Terminal" if self.vo_driver == "sixel" else "MPV Window"
+        self.set_status(f"Playing ({mode_label}): @{author} [j/↓: Next, k/↑: Prev, ESC/q: Exit]", CYAN)
         self.draw()
 
-        new_idx, msg = play_feed_in_terminal(
+        new_idx, msg = play_feed(
             items=items,
             start_index=idx,
             vo_driver=self.vo_driver

@@ -48,15 +48,20 @@ YTDLP_PATH = shutil.which("yt-dlp") or "yt-dlp"
 THUMB_MAX_WIDTH = 32
 THUMB_MAX_HEIGHT = 14
 DEFAULT_REGION = "US"
+# Supported video drivers: 'sixel' (in-terminal) or 'mpv' (external window)
+VALID_VO_DRIVERS = ("sixel", "mpv")
 
 
 def get_default_vo_driver() -> str:
     env_driver = os.environ.get("TIKCLI_VO")
     if env_driver:
-        return env_driver.lower()
-    # Default to 24-bit TrueColor (tct) for 100% accurate colors with zero banding or dithering grains.
-    # Users can toggle to high-res pixel mode at any time using ':vo sixel' or ':vo'.
-    return "tct"
+        d = env_driver.lower()
+        if d in ("mpv", "window", "external", "gui"):
+            return "mpv"
+        if d == "sixel":
+            return "sixel"
+    # Default to sixel for in-terminal playback, toggleable to external mpv window
+    return "sixel"
 
 
 DEFAULT_VO_DRIVER = get_default_vo_driver()
