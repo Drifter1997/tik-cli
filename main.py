@@ -9,10 +9,10 @@ from tikcli.config import SESSION_FILE
 
 def main():
     parser = argparse.ArgumentParser(
-        description="tik-cli: Minimal TikTok CLI/TUI with in-terminal video playback and RAM streaming."
+        description="tik-cli: Minimal TikTok CLI/TUI with external MPV video playback and IMV image viewer."
     )
-    parser.add_argument("--play", type=str, help="Directly play a TikTok video URL in the terminal")
-    parser.add_argument("--vo", choices=["sixel", "mpv"], help="Video output mode: 'sixel' (terminal) or 'mpv' (external window)")
+    parser.add_argument("--play", type=str, help="Directly play a TikTok video URL in external MPV window")
+    parser.add_argument("--vo", choices=["mpv"], default="mpv", help="Video output driver: 'mpv' (external hardware-accelerated window)")
     parser.add_argument("--user", type=str, help="Launch TUI directly on a specific creator's profile (@username)")
     parser.add_argument("--session", type=str, help="Authenticate directly with a TikTok sessionid cookie")
     parser.add_argument("--ttwid", type=str, help="Optional ttwid cookie for authentication")

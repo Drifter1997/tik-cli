@@ -63,7 +63,7 @@ def strip_ansi(text: str) -> str:
 
 
 class RawTerminal:
-    """Context manager for terminal raw/cbreak mode with SGR mouse tracking."""
+    """Context manager for terminal raw/cbreak mode with alternate screen buffer & SGR mouse tracking."""
     def __init__(self, enable_mouse: bool = True):
         self.fd = sys.stdin.fileno() if sys.stdin.isatty() else None
         self.old_settings = None
@@ -73,17 +73,21 @@ class RawTerminal:
         if self.fd is not None:
             self.old_settings = termios.tcgetattr(self.fd)
             tty.setcbreak(self.fd)
+            # Enter alternate screen buffer, hide cursor, enable mouse tracking
+            sys.stdout.write("\033[?1049h\033[?25l")
             if self.enable_mouse:
-                # Enable button reporting and SGR extended coordinates for mouse/touchpad scrolling
-                sys.stdout.write("\033[?1000h\033[?1006h\033[?25l")
-                sys.stdout.flush()
+                sys.stdout.write("\033[?1000h\033[?1006h")
+            sys.stdout.write("\033[2J\033[H")
+            sys.stdout.flush()
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         if self.fd is not None:
             if self.enable_mouse:
-                sys.stdout.write("\033[?1000l\033[?1006l\033[?25h\033[0m")
-                sys.stdout.flush()
+                sys.stdout.write("\033[?1000l\033[?1006l")
+            # Show cursor, leave alternate screen buffer, reset attributes
+            sys.stdout.write("\033[?25h\033[?1049l\033[0m")
+            sys.stdout.flush()
             if self.old_settings is not None:
                 termios.tcsetattr(self.fd, termios.TCSADRAIN, self.old_settings)
 
@@ -234,11 +238,16 @@ class TerminalUI:
         self.mode = "feed"  # "feed", "creator", "dms"
         self.feed_items: List[Dict[str, Any]] = []
         self.feed_index = 0
+        self.feed_scroll_offset = 0
+
         self.creator_items: List[Dict[str, Any]] = []
         self.creator_index = 0
+        self.creator_scroll_offset = 0
         self.current_creator = "tiktok"
+
         self.dms_items: List[Dict[str, Any]] = []
         self.dms_index = 0
+        self.dms_scroll_offset = 0
 
         # Command & Search input prompt state
         self.input_mode = False
@@ -247,22 +256,34 @@ class TerminalUI:
         self.input_action: Optional[Callable[[str], None]] = None
 
         # Status notification
-        self.status_message = "Ready. Press Enter to play in terminal."
+        self.status_message = "Ready. Press Enter to play in external MPV window."
         self.status_time = time.time()
         self.status_color = GREEN
 
         # Cached thumbnails
         self._thumbnail_cache: Dict[str, List[str]] = {}
 
-        # Video driver selection (tct or sixel)
-        self.vo_driver = DEFAULT_VO_DRIVER
+        # Video driver selection (strictly external MPV window)
+        self.vo_driver = "mpv"
         self.force_clear = True
 
         atexit.register(self._cleanup_terminal)
 
     def _cleanup_terminal(self):
-        sys.stdout.write("\033[?1000l\033[?1006l\033[?25h\033[0m")
+        sys.stdout.write("\033[?1000l\033[?1006l\033[?25h\033[?1049l\033[0m")
         sys.stdout.flush()
+
+    def get_scroll_offset(self, selected: int, current_offset: int, height: int, total_items: int) -> int:
+        """Keep selected cursor inside the visible viewport and scroll smoothly at borders."""
+        if height <= 0 or total_items <= 0:
+            return 0
+        offset = current_offset
+        if selected < offset:
+            offset = selected
+        elif selected >= offset + height:
+            offset = selected - height + 1
+        max_offset = max(0, total_items - height)
+        return max(0, min(offset, max_offset))
 
     def set_status(self, msg: str, color: str = GREEN):
         self.status_message = msg
@@ -270,34 +291,67 @@ class TerminalUI:
         self.status_color = color
 
     def run(self):
-        """Main UI event loop."""
-        # Initial silent session check
+        """Main UI event loop with instant startup render and event-driven updates."""
         sess = self.client.check_session()
         if sess["status"] == "active":
             self.set_status(f"Authenticated as @{sess.get('username')}", GREEN)
         else:
             self.set_status("Guest Mode (No login required). Loading trending feed...", CYAN)
 
-        # Initial feed load
-        self.load_feed()
+        # Pre-load cached feed instantly if available so user sees content in <10ms
+        feed_cache_file = RAM_DIR / "cached_feed.json"
+        if feed_cache_file.exists():
+            try:
+                import json
+                cached = json.loads(feed_cache_file.read_text())
+                if isinstance(cached, list) and cached:
+                    self.feed_items = cached
+                    self.feed_index = 0
+                    self.feed_scroll_offset = 0
+                    self.set_status(f"Loaded {len(cached)} videos from cache. Updating...", GREEN)
+            except Exception:
+                pass
 
         with RawTerminal(enable_mouse=True):
+            # Render UI immediately so screen never appears frozen
+            self.draw()
+
+            # If no cached items, fetch live feed with on-screen status updates
+            if not self.feed_items:
+                self.load_feed()
+
             while self.running:
-                self.draw()
-                key = read_key(timeout=0.08)
+                key = read_key(timeout=0.15)
                 if key:
                     self.handle_input(key)
+                    self.draw()
+                elif getattr(self, "force_clear", False):
+                    self.draw()
 
     def load_feed(self):
-        """Fetch trending / FYP feed."""
+        """Fetch trending / FYP feed with on-screen progress and retry fallback."""
         self.set_status("Fetching trending TikTok feed...", CYAN)
-        items = self.client.get_feed(count=25)
+        self.draw()
+        items = []
+        for attempt in range(1, 4):
+            items = self.client.get_feed(count=25)
+            if items:
+                break
+            if attempt < 3:
+                self.set_status(f"Connecting to TikTok feed (attempt {attempt + 1}/3)...", YELLOW)
+                self.draw()
+                time.sleep(0.3)
+
         if items:
             self.feed_items = items
             self.feed_index = min(self.feed_index, len(self.feed_items) - 1)
+            self.feed_scroll_offset = self.get_scroll_offset(self.feed_index, self.feed_scroll_offset, 20, len(items))
             self.set_status(f"Loaded {len(items)} trending videos.", GREEN)
         else:
-            self.set_status("Failed to load trending feed. Check network.", RED)
+            if not self.feed_items:
+                self.set_status("Failed to load trending feed. Press 'r' to retry or '/' to search.", RED)
+        self.force_clear = True
+        self.draw()
 
     def load_creator(self, username: str):
         """Fetch videos for specific creator."""
@@ -311,10 +365,12 @@ class TerminalUI:
         if items:
             self.creator_items = items
             self.creator_index = 0
+            self.creator_scroll_offset = 0
             self.mode = "creator"
             self.set_status(f"Loaded {len(items)} videos for @{clean_user}.", GREEN)
         else:
             self.set_status(f"No videos found for @{clean_user}.", YELLOW)
+        self.force_clear = True
 
     def load_direct_url(self, url: str):
         """Resolve a direct TikTok video URL."""
@@ -324,17 +380,19 @@ class TerminalUI:
         if video:
             self.feed_items.insert(0, video)
             self.feed_index = 0
+            self.feed_scroll_offset = 0
             self.mode = "feed"
             self.set_status(f"Loaded video by @{video.get('author_id')}.", GREEN)
         else:
             self.set_status("Could not resolve video URL.", RED)
+        self.force_clear = True
 
     # -------------------------------------------------------------------------
     # Rendering
     # -------------------------------------------------------------------------
 
     def draw(self):
-        """Render complete screen buffer."""
+        """Render complete screen buffer without terminal scrolling."""
         term_size = shutil.get_terminal_size((80, 24))
         cols = term_size.columns
         lines = term_size.lines
@@ -345,19 +403,23 @@ class TerminalUI:
             self.force_clear = False
         buf.append("\033[H")  # Move to top-left
 
-        # 1. Header
+        # 1. Header (3 lines)
         header_lines = self.render_header(cols)
-        buf.extend(header_lines)
 
-        # 2. Main Content Area
-        avail_height = max(10, lines - len(header_lines) - 3)
+        # 2. Main Content Area (lines - 7 so total screen never touches bottom row)
+        avail_height = max(5, lines - len(header_lines) - 4)
         content_lines = self.render_content(cols, avail_height)
-        buf.extend(content_lines)
 
-        # 3. Footer / Status bar
+        # 3. Footer / Status bar (3 lines)
         footer_lines = self.render_footer(cols)
-        buf.extend(footer_lines)
 
+        all_lines = []
+        for line in header_lines + content_lines + footer_lines:
+            clean = line.rstrip("\r\n")
+            all_lines.append(clean)
+
+        # Output with \r\n and NO trailing newline to prevent any terminal scrolling
+        buf.append("\r\n".join(all_lines))
         sys.stdout.write("".join(buf))
         sys.stdout.flush()
 
@@ -374,7 +436,7 @@ class TerminalUI:
 
         title_bar = f" {logo} {GRAY}│{RESET} {DIM}Terminal TikTok Client{RESET}"
         gap = width - len(strip_ansi(title_bar)) - len(strip_ansi(auth_badge)) - 2
-        lines.append(f"{BG_HEADER}{title_bar}{' ' * max(1, gap)}{auth_badge} {RESET}\n")
+        lines.append(f"{BG_HEADER}{title_bar}{' ' * max(1, gap)}{auth_badge} {RESET}")
 
         # Mode Tab Bar
         tab_feed = f"{BOLD}{CYAN}[1] 🔥 For You / Trending{RESET}" if self.mode == "feed" else f"{GRAY}[1] For You{RESET}"
@@ -382,15 +444,15 @@ class TerminalUI:
         tab_dms = f"{BOLD}{CYAN}[3] 💬 Direct Messages{RESET}" if self.mode == "dms" else f"{GRAY}[3] Messages{RESET}"
 
         tabs_str = f"  {tab_feed}    {tab_creator}    {tab_dms}"
-        lines.append(f"{tabs_str}\n")
-        lines.append(f"{GRAY}{'─' * width}{RESET}\n")
+        lines.append(tabs_str)
+        lines.append(f"{GRAY}{'─' * max(1, width - 1)}{RESET}")
         return lines
 
     def render_content(self, width: int, height: int) -> List[str]:
         if self.mode == "dms":
             return self.render_dms(width, height)
 
-        # Split into Left List (55%) and Right Preview (45%)
+        # Split into Left List (52%) and Right Preview (48%)
         left_w = max(35, int(width * 0.52))
         right_w = max(30, width - left_w - 3)
 
@@ -398,30 +460,36 @@ class TerminalUI:
         selected_idx = self.feed_index if self.mode == "feed" else self.creator_index
 
         left_lines = self.render_video_list(items, selected_idx, left_w, height)
-        selected_video = items[selected_idx] if (items and selected_idx < len(items)) else None
+        selected_video = items[selected_idx] if (items and 0 <= selected_idx < len(items)) else None
         right_lines = self.render_preview(selected_video, right_w, height)
 
         combined = []
         for i in range(height):
             l_str = left_lines[i] if i < len(left_lines) else " " * left_w
             r_str = right_lines[i] if i < len(right_lines) else " " * right_w
-            # Clear to end of line (\033[K) to avoid ghosting artifacts
-            combined.append(f"{l_str} {GRAY}│{RESET} {r_str}\033[K\n")
+            combined.append(f"{l_str} {GRAY}│{RESET} {r_str}\033[K")
 
         return combined
 
     def render_video_list(self, items: List[Dict[str, Any]], selected: int, width: int, height: int) -> List[str]:
         lines = []
         if not items:
-            lines.append(f"{DIM}  No videos loaded. Press 'r' to refresh or '/' to search.{RESET}".ljust(width))
+            msg1 = f"  {CYAN}{BOLD}⏳ Connecting to TikTok...{RESET}"
+            msg2 = f"  {DIM}Fetching trending videos (Press 'r' to retry, '/' to search creator){RESET}"
+            lines.append(f"{msg1}{' ' * max(0, width - len(strip_ansi(msg1)))}")
+            lines.append(f"{msg2}{' ' * max(0, width - len(strip_ansi(msg2)))}")
             while len(lines) < height:
                 lines.append(" " * width)
             return lines
 
-        # Scrolling window calculation
-        scroll_start = 0
-        if selected >= height:
-            scroll_start = selected - height + 1
+        # Viewport scrolling offset: keeps cursor inside window and only scrolls when hitting borders
+        current_offset = self.feed_scroll_offset if self.mode == "feed" else self.creator_scroll_offset
+        scroll_start = self.get_scroll_offset(selected, current_offset, height, len(items))
+        if self.mode == "feed":
+            self.feed_scroll_offset = scroll_start
+        else:
+            self.creator_scroll_offset = scroll_start
+
         visible_items = items[scroll_start:scroll_start + height]
 
         for i, item in enumerate(visible_items):
@@ -433,24 +501,30 @@ class TerminalUI:
             dur = format_duration(item.get("duration", 0))
             likes = format_count(item.get("likes", 0))
 
+            is_photo = item.get("is_photo", False)
+            photo_tag = f"{YELLOW}[📸 Photo]{RESET} " if is_photo else ""
+
             title = item.get("title", "").replace("\n", " ")
-            max_title_len = max(10, width - len(author) - len(dur) - len(likes) - 10)
+            extra_len = len(author) + len(dur) + len(likes) + (10 if is_photo else 0) + 12
+            max_title_len = max(10, width - extra_len)
             if len(title) > max_title_len:
                 title = title[:max_title_len - 1] + "…"
 
             if is_active:
                 row = (
-                    f"{marker} {BOLD}{WHITE}{title}{RESET} "
+                    f"{marker} {photo_tag}{BOLD}{WHITE}{title}{RESET} "
                     f"{CYAN}{author}{RESET} {RED}♥{likes}{RESET} {DIM}{dur}{RESET}"
                 )
-                bg_colored = f"{BG_ACTIVE}{row}{' ' * max(0, width - len(strip_ansi(row)))}{RESET}"
+                vis_len = len(strip_ansi(row))
+                bg_colored = f"{BG_ACTIVE}{row}{' ' * max(0, width - vis_len)}{RESET}"
                 lines.append(bg_colored)
             else:
                 row = (
-                    f"{marker} {LIGHT_GRAY}{title}{RESET} "
+                    f"{marker} {photo_tag}{LIGHT_GRAY}{title}{RESET} "
                     f"{GRAY}{author}{RESET} {DIM}♥{likes} {dur}{RESET}"
                 )
-                lines.append(f"{row}{' ' * max(0, width - len(strip_ansi(row)))}")
+                vis_len = len(strip_ansi(row))
+                lines.append(f"{row}{' ' * max(0, width - vis_len)}")
 
         while len(lines) < height:
             lines.append(" " * width)
@@ -533,21 +607,24 @@ class TerminalUI:
             add_line()
 
         # Playback Settings & Info Card
-        mode_desc = (
-            f"{GREEN}{BOLD}SIXEL (In-Terminal){RESET} {DIM}[j/k: Feed Scroll]{RESET}"
-            if self.vo_driver == "sixel"
-            else f"{CYAN}{BOLD}MPV (External Window){RESET} {DIM}[GPU TrueColor, j/k: Feed Scroll]{RESET}"
-        )
-        add_line(f"  ⚙️  {BOLD}{LIGHT_GRAY}Playback Mode:{RESET}")
-        add_line(f"    {mode_desc}")
+        is_photo = video.get("is_photo", False)
+        images = video.get("images") or []
+        add_line(f"  ⚙️  {BOLD}{LIGHT_GRAY}Playback & Display:{RESET}")
+        add_line(f"    {CYAN}{BOLD}External MPV Window{RESET} {DIM}[Wayland 60fps GPU TrueColor]{RESET}")
+        if is_photo:
+            add_line(f"    {YELLOW}{BOLD}External IMV Gallery{RESET} {DIM}[📸 {len(images)} Photo Slideshow]{RESET}")
+        else:
+            add_line(f"    {YELLOW}{BOLD}External IMV Viewer{RESET} {DIM}[HD Cover Image Viewer]{RESET}")
         add_line()
 
         # Quick Action Shortcuts Card
         add_line(f"  {BOLD}{CYAN}─── QUICK ACTIONS ──────────────────────────────────────────{RESET}"[:width])
-        add_line(f"    {BOLD}[Enter]{RESET}  Watch Video (Looping + Feed Scrolling)")
-        toggle_target = "External MPV Window" if self.vo_driver == "sixel" else "In-Terminal SIXEL"
-        add_line(f"    {BOLD}[v]{RESET}      Switch Mode to {toggle_target}")
-        add_line(f"    {BOLD}[t]{RESET}      Open Original HD Cover Photo")
+        if is_photo:
+            add_line(f"    {BOLD}[Enter]{RESET}  Watch Slideshow Soundtrack in MPV Window")
+            add_line(f"    {BOLD}[t]{RESET}      View {len(images)} Full-Res Photos in External IMV")
+        else:
+            add_line(f"    {BOLD}[Enter]{RESET}  Watch Video in External MPV Window")
+            add_line(f"    {BOLD}[t]{RESET}      View Original HD Cover in External IMV")
         add_line(f"    {BOLD}[:d]{RESET}     Download Video MP4 to ~/Downloads/")
         add_line(f"    {BOLD}[:m]{RESET}     Play Audio Soundtrack Only")
 
@@ -585,19 +662,17 @@ class TerminalUI:
 
     def render_footer(self, width: int) -> List[str]:
         lines = []
-        lines.append(f"{GRAY}{'─' * width}{RESET}\n")
+        lines.append(f"{GRAY}{'─' * max(1, width - 1)}{RESET}")
 
         if self.input_mode:
             # Active command/search input bar
             prompt_str = f"{CYAN}{BOLD}{self.input_prompt}{RESET}{self.input_buffer}{CYAN}█{RESET}"
-            lines.append(f"{prompt_str}\n")
+            lines.append(prompt_str)
         else:
             # Controls and Dynamic Status bar
-            driver_tag = f"{GREEN}SIXEL{RESET}" if self.vo_driver == "sixel" else f"{CYAN}MPV Window{RESET}"
             shortcuts = (
-                f"{BOLD}[Enter]{RESET} Watch ({driver_tag})  "
-                f"{BOLD}[v]{RESET} Mode  "
-                f"{BOLD}[t]{RESET} Cover  "
+                f"{BOLD}[Enter]{RESET} Watch (MPV)  "
+                f"{BOLD}[t]{RESET} Cover/Photos (IMV)  "
                 f"{BOLD}[:d]{RESET} Download  "
                 f"{BOLD}[:m]{RESET} Audio  "
                 f"{BOLD}[/]{RESET} Search  "
@@ -605,8 +680,8 @@ class TerminalUI:
                 f"{BOLD}[:q]{RESET} Quit"
             )
             status = f"{self.status_color}{self.status_message}{RESET}"
-            lines.append(f"{shortcuts}\n")
-            lines.append(f"{BG_STATUS} {status}{' ' * max(0, width - len(strip_ansi(status)) - 2)} {RESET}\n")
+            lines.append(shortcuts)
+            lines.append(f"{BG_STATUS} {status}{' ' * max(0, width - len(strip_ansi(status)) - 2)} {RESET}")
 
         return lines
 
@@ -656,8 +731,6 @@ class TerminalUI:
             self.mode = "creator"
         elif key in ("3",):
             self.mode = "dms"
-        elif key in ("v", "w"):
-            self.action_toggle_vo()
         elif key == "t":
             self.action_view_thumbnail()
         elif key == "ENTER":
@@ -720,19 +793,6 @@ class TerminalUI:
             elif cmd.startswith("user ") or cmd.startswith("creator "):
                 user = cmd.split(" ", 1)[1]
                 self.load_creator(user)
-            elif cmd in ("vo", "v"):
-                self.action_toggle_vo()
-            elif cmd.startswith("vo "):
-                parts = cmd.split(" ", 1)
-                driver = parts[1].strip().lower()
-                if driver in ("mpv", "window", "external", "gui"):
-                    self.vo_driver = "mpv"
-                    self.set_status("Video output mode: External MPV Window (GPU TrueColor).", GREEN)
-                elif driver == "sixel":
-                    self.vo_driver = "sixel"
-                    self.set_status("Video output mode: In-Terminal SIXEL.", GREEN)
-                else:
-                    self.set_status("Invalid mode. Use ':vo sixel' or ':vo mpv'.", RED)
             elif cmd in ("thumb", "thumbnail", "cover"):
                 self.action_view_thumbnail()
             elif cmd == "login":
@@ -741,7 +801,7 @@ class TerminalUI:
                 self.client.logout()
                 self.set_status("Logged out. Switched to Guest Mode.", YELLOW)
             elif cmd == "help":
-                self.set_status("Keys: Enter=watch, v=toggle sixel/mpv, t=cover, :d=download, :m=audio, /=search, :q=quit", CYAN)
+                self.set_status("Keys: Enter=watch (MPV), t=cover/photos (IMV), :d=download, :m=audio, /=search, :q=quit", CYAN)
             elif cmd:
                 self.set_status(f"Unknown command: :{cmd}", RED)
 
@@ -777,27 +837,24 @@ class TerminalUI:
             return items[idx]
         return None
 
-    def action_toggle_vo(self):
-        self.vo_driver = "mpv" if self.vo_driver == "sixel" else "sixel"
-        mode_desc = "External MPV Window (GPU TrueColor)" if self.vo_driver == "mpv" else "In-Terminal SIXEL"
-        self.set_status(f"Video mode switched to: {mode_desc}", GREEN)
-
     def action_view_thumbnail(self):
         video = self.get_selected_video()
         if not video:
             self.set_status("No video selected.", RED)
             return
         cover_url = video.get("cover_url", "")
-        if not cover_url:
-            self.set_status("No cover URL available for this video.", RED)
+        images = video.get("images") or []
+        if not cover_url and not images:
+            self.set_status("No cover URL or images available for this video.", RED)
             return
-        self.set_status("Opening HD cover thumbnail in image viewer...", CYAN)
+        self.set_status("Opening image(s) in external IMV viewer...", CYAN)
         self.draw()
-        ok, msg = view_thumbnail(cover_url, title=video.get("title", ""))
+        ok, msg = view_thumbnail(cover_url, title=video.get("title", ""), extra_images=images)
+        self.force_clear = True
         self.set_status(msg, GREEN if ok else RED)
 
     def action_play_selected(self):
-        """Play feed with looping, next/prev scrolling, and pos tracking (SIXEL or MPV window)."""
+        """Play feed in external MPV window with looping, next/prev scrolling, and pos tracking."""
         items = self.feed_items if self.mode == "feed" else self.creator_items
         idx = self.feed_index if self.mode == "feed" else self.creator_index
         if not items or not (0 <= idx < len(items)):
@@ -806,24 +863,24 @@ class TerminalUI:
 
         video = items[idx]
         author = video.get("author_id", "creator")
-        mode_label = "SIXEL Terminal" if self.vo_driver == "sixel" else "MPV Window"
-        self.set_status(f"Playing ({mode_label}): @{author} [j/↓: Next, k/↑: Prev, ESC/q: Exit]", CYAN)
+        self.set_status(f"Launching MPV: @{author} [j/↓: Next, k/↑: Prev, ESC/q: Exit]", CYAN)
         self.draw()
 
         new_idx, msg = play_feed(
             items=items,
             start_index=idx,
-            vo_driver=self.vo_driver
+            vo_driver="mpv"
         )
 
         if self.mode == "feed":
             self.feed_index = new_idx
+            self.feed_scroll_offset = self.get_scroll_offset(new_idx, self.feed_scroll_offset, 20, len(items))
         else:
             self.creator_index = new_idx
+            self.creator_scroll_offset = self.get_scroll_offset(new_idx, self.creator_scroll_offset, 20, len(items))
 
         self.force_clear = True
         self.set_status(msg, GREEN)
-
 
     def action_download_selected(self):
         """Explicitly download the selected video (:d)."""

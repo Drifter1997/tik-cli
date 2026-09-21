@@ -133,28 +133,61 @@ def get_inline_thumbnail(image_url: str, max_width: int = THUMB_MAX_WIDTH, max_h
     return _THUMBNAIL_CACHE.get(cache_key, "")
 
 
-def view_thumbnail(image_url: str, title: str = "") -> Tuple[bool, str]:
-    """Open original high-resolution cover thumbnail in external image viewer (imv or mpv)."""
-    if not image_url:
+def view_thumbnail(
+    image_url: str,
+    title: str = "",
+    extra_images: Optional[list] = None
+) -> Tuple[bool, str]:
+    """Open original high-resolution cover thumbnail or photo gallery in external image viewer (imv)."""
+    urls = []
+    if extra_images:
+        urls.extend([u for u in extra_images if u])
+    if image_url and image_url not in urls:
+        urls.insert(0, image_url)
+
+    if not urls:
         return False, "No thumbnail URL available."
-    raw_bytes = fetch_bytes_in_ram(image_url)
-    if not raw_bytes:
-        return False, "Failed to download thumbnail image."
-    thumb_file = RAM_DIR / "preview_cover.jpg"
-    thumb_file.write_bytes(raw_bytes)
+
     viewer = shutil.which("imv") or shutil.which("mpv")
     if not viewer:
-        return False, "No image viewer (imv or mpv) found."
+        return False, "No image viewer (imv) found."
+
+    # Download image(s) into RAM tmpfs
+    RAM_DIR.mkdir(parents=True, exist_ok=True)
+    downloaded_files = []
+    for i, u in enumerate(urls[:20]):
+        raw_bytes = fetch_bytes_in_ram(u)
+        if raw_bytes:
+            suffix = ".jpg"
+            if raw_bytes.startswith(b"\x89PNG"):
+                suffix = ".png"
+            elif raw_bytes.startswith(b"RIFF") and b"WEBP" in raw_bytes[:16]:
+                suffix = ".webp"
+            f_path = RAM_DIR / f"thumb_{i:02d}{suffix}"
+            f_path.write_bytes(raw_bytes)
+            downloaded_files.append(str(f_path))
+
+    if not downloaded_files:
+        return False, "Failed to download thumbnail image."
+
     try:
+        # Pause terminal mouse reporting before opening imv window
+        sys.stdout.write("\033[?1000l\033[?1006l\033[?25h")
+        sys.stdout.flush()
+
         if "imv" in viewer:
-            cmd = [viewer, str(thumb_file)]
+            cmd = [viewer] + downloaded_files
         else:
             clean_title = (title or "Cover").replace('"', '')[:40]
-            cmd = [viewer, "--no-config", "--force-window=yes", f"--title=Cover: {clean_title}", str(thumb_file)]
-        subprocess.run(cmd, capture_output=True, timeout=30)
-        return True, "Closed thumbnail preview."
+            cmd = [viewer, "--no-config", "--force-window=yes", f"--title=Cover: {clean_title}"] + downloaded_files
+
+        subprocess.run(cmd, stdin=subprocess.DEVNULL, capture_output=True, timeout=120)
+        return True, f"Closed cover image viewer ({len(downloaded_files)} photo{'s' if len(downloaded_files) > 1 else ''})."
     except Exception as e:
         return False, f"Error showing thumbnail: {e}"
+    finally:
+        sys.stdout.write("\033[?1000h\033[?1006h\033[?25l")
+        sys.stdout.flush()
 
 
 def play_feed(
@@ -163,15 +196,11 @@ def play_feed(
     vo_driver: Optional[str] = None
 ) -> Tuple[int, str]:
     """
-    Play TikTok feed with seamless loop and next/previous scrolling:
-    - Current video plays on continuous loop (just like TikTok mobile app).
+    Play TikTok feed using hardware-accelerated external MPV window with seamless feed navigation:
+    - Active video loops continuously (--loop-file=inf).
     - Down arrow / 'j' / PageDown: forwards to NEXT video and loops it.
     - Up arrow / 'k' / PageUp: goes back to PREVIOUS video and loops it.
-    - ESC / 'q' / Ctrl+C: stops playback and returns to TUI at the current video position.
-
-    Modes:
-    - 'sixel': In-Terminal high-fidelity Sixel graphics.
-    - 'mpv': External MPV window with hardware-accelerated GPU rendering.
+    - ESC / 'q' / Ctrl+C: stops playback and returns to TUI at the exact video watched.
     """
     if not items:
         return start_index, "No videos in feed to play."
@@ -179,10 +208,7 @@ def play_feed(
     if not shutil.which(MPV_PATH) and not Path(MPV_PATH).exists():
         return start_index, f"mpv player not found at '{MPV_PATH}'."
 
-    from tikcli.config import DEFAULT_VO_DRIVER, RAM_DIR
     RAM_DIR.mkdir(parents=True, exist_ok=True)
-    raw_driver = (vo_driver or DEFAULT_VO_DRIVER or "sixel").lower()
-    selected_driver = "mpv" if raw_driver in ("mpv", "window", "external", "gui") else "sixel"
 
     # 1. Filter playable items and maintain index mapping
     valid_entries: List[Tuple[int, Dict[str, Any]]] = []
@@ -262,114 +288,58 @@ end)
 """
     tracker_lua.write_text(lua_code)
 
-    if selected_driver == "mpv":
-        # External MPV GUI Mode: native Wayland window, full original resolution GPU rendering
-        cmd = [
-            MPV_PATH,
-            "--no-config",
-            "--force-window=yes",
-            "--vo=gpu,wlshm,gpu-next",
-            "--loop-file=inf",
-            "--loop-playlist=inf",
-            f"--playlist={m3u_file}",
-            f"--playlist-start={m3u_start_idx}",
-            f"--input-conf={input_conf_file}",
-            f"--script={tracker_lua}",
-            "--title=tik-cli: @${media-title}",
-            "--app-id=tik-cli-player",
-            "--http-header-fields-append=Referer: https://www.tiktok.com/",
-            "--http-header-fields-append=User-Agent: Mozilla/5.0 (X11; Linux x86_64)",
-        ]
+    # External MPV Mode: native GPU-accelerated window, full original resolution
+    cmd = [
+        MPV_PATH,
+        "--no-config",
+        "--force-window=yes",
+        "--vo=gpu,wlshm,gpu-next",
+        "--loop-file=inf",
+        "--loop-playlist=inf",
+        f"--playlist={m3u_file}",
+        f"--playlist-start={m3u_start_idx}",
+        f"--input-conf={input_conf_file}",
+        f"--script={tracker_lua}",
+        "--title=tik-cli: @${media-title}",
+        "--wayland-app-id=tik-cli-player",
+        "--x11-name=tik-cli-player",
+        "--input-terminal=no",
+        "--http-header-fields-append=Referer: https://www.tiktok.com/",
+        "--http-header-fields-append=User-Agent: Mozilla/5.0 (X11; Linux x86_64)",
+    ]
 
-        last_index = start_index
-        try:
-            proc = subprocess.run(cmd)
-            if tracker_file.exists():
-                try:
-                    val = int(tracker_file.read_text().strip())
-                    if 0 <= val < len(valid_entries):
-                        last_index = valid_entries[val][0]
-                except Exception:
-                    pass
-            msg = "Returned from external MPV player."
-        except KeyboardInterrupt:
-            if tracker_file.exists():
-                try:
-                    val = int(tracker_file.read_text().strip())
-                    if 0 <= val < len(valid_entries):
-                        last_index = valid_entries[val][0]
-                except Exception:
-                    pass
-            msg = "Playback closed."
-        except Exception as e:
-            msg = f"Playback error: {e}"
+    # Pause terminal mouse reporting before launching MPV window
+    sys.stdout.write("\033[?1000l\033[?1006l\033[?25h")
+    sys.stdout.flush()
 
-        return last_index, msg
-
-    else:
-        # In-Terminal Sixel Mode: fixed scaling utilizing full terminal height
-        pixel_w, pixel_h = get_terminal_pixel_size()
-
-        cmd = [
-            MPV_PATH,
-            "--no-config",
-            "--terminal=yes",              # Enables interactive keyboard stdin reader
-            "--input-terminal=yes",        # Binds keyboard controls directly to stdin
-            "--force-window=no",
-            "--loop-file=inf",             # Continuous loop on each video!
-            "--loop-playlist=inf",         # Continuous next/prev cycling
-            f"--playlist={m3u_file}",
-            f"--playlist-start={m3u_start_idx}",
-            f"--input-conf={input_conf_file}",
-            f"--script={tracker_lua}",
-            "--term-osd-bar=no",           # Suppress terminal text seekbar
-            "--term-status-msg=",          # Suppress terminal status line spam
-            "--msg-level=all=no",          # Suppress terminal log output
-            "--http-header-fields-append=Referer: https://www.tiktok.com/",
-            "--http-header-fields-append=User-Agent: Mozilla/5.0 (X11; Linux x86_64)",
-            "--vo=sixel",
-            f"--vo-sixel-width={pixel_w}",
-            f"--vo-sixel-height={pixel_h}",
-            "--vo-sixel-fixedpalette=no",
-            "--vo-sixel-threshold=-1",
-            "--vo-sixel-reqcolors=256",
-            "--vo-sixel-dither=none",
-            "--vo-sixel-buffered=yes",
-        ]
-
-        # Disable mouse tracking before mpv so mouse escapes do not flood stdin,
-        # save alternate screen buffer, clear screen, and show cursor
-        sys.stdout.write("\033[?1000l\033[?1006l\033[?1049h\033[2J\033[H\033[?25h")
+    last_index = start_index
+    try:
+        proc = subprocess.run(cmd, stdin=subprocess.DEVNULL)
+        if tracker_file.exists():
+            try:
+                val = int(tracker_file.read_text().strip())
+                if 0 <= val < len(valid_entries):
+                    last_index = valid_entries[val][0]
+            except Exception:
+                pass
+        msg = "Returned from external MPV player."
+    except KeyboardInterrupt:
+        if tracker_file.exists():
+            try:
+                val = int(tracker_file.read_text().strip())
+                if 0 <= val < len(valid_entries):
+                    last_index = valid_entries[val][0]
+            except Exception:
+                pass
+        msg = "Playback closed."
+    except Exception as e:
+        msg = f"Playback error: {e}"
+    finally:
+        # Restore terminal mouse reporting
+        sys.stdout.write("\033[?1000h\033[?1006h\033[?25l")
         sys.stdout.flush()
 
-        last_index = start_index
-        try:
-            proc = subprocess.run(cmd)
-            if tracker_file.exists():
-                try:
-                    val = int(tracker_file.read_text().strip())
-                    if 0 <= val < len(valid_entries):
-                        last_index = valid_entries[val][0]
-                except Exception:
-                    pass
-            msg = "Returned to menu."
-        except KeyboardInterrupt:
-            if tracker_file.exists():
-                try:
-                    val = int(tracker_file.read_text().strip())
-                    if 0 <= val < len(valid_entries):
-                        last_index = valid_entries[val][0]
-                except Exception:
-                    pass
-            msg = "Playback stopped."
-        except Exception as e:
-            msg = f"Playback error: {e}"
-        finally:
-            # Restore normal screen buffer, clear, hide cursor, and re-enable SGR mouse tracking
-            sys.stdout.write("\033[?1049l\033[2J\033[H\033[?25l\033[?1000h\033[?1006h")
-            sys.stdout.flush()
-
-        return last_index, msg
+    return last_index, msg
 
 
 # Backward compatibility alias

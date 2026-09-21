@@ -48,20 +48,12 @@ YTDLP_PATH = shutil.which("yt-dlp") or "yt-dlp"
 THUMB_MAX_WIDTH = 32
 THUMB_MAX_HEIGHT = 14
 DEFAULT_REGION = "US"
-# Supported video drivers: 'sixel' (in-terminal) or 'mpv' (external window)
-VALID_VO_DRIVERS = ("sixel", "mpv")
+# Supported video drivers: 'mpv' (external hardware-accelerated GPU window)
+VALID_VO_DRIVERS = ("mpv",)
 
 
 def get_default_vo_driver() -> str:
-    env_driver = os.environ.get("TIKCLI_VO")
-    if env_driver:
-        d = env_driver.lower()
-        if d in ("mpv", "window", "external", "gui"):
-            return "mpv"
-        if d == "sixel":
-            return "sixel"
-    # Default to sixel for in-terminal playback, toggleable to external mpv window
-    return "sixel"
+    return "mpv"
 
 
 DEFAULT_VO_DRIVER = get_default_vo_driver()

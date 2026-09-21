@@ -4,13 +4,15 @@ import time
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Tuple
 import requests
+from urllib3.util import Retry
+from requests.adapters import HTTPAdapter
 
 try:
     import yt_dlp
 except ImportError:
     yt_dlp = None
 
-from tikcli.config import CONFIG_DIR, SESSION_FILE, DEVICE_FILE, DEFAULT_REGION
+from tikcli.config import CONFIG_DIR, SESSION_FILE, DEVICE_FILE, DEFAULT_REGION, RAM_DIR
 
 
 class TikTokClient:
@@ -23,11 +25,20 @@ class TikTokClient:
 
     def __init__(self):
         self.session = requests.Session()
+        retries = Retry(
+            total=4,
+            backoff_factor=0.3,
+            status_forcelist=[429, 500, 502, 503, 504, 520, 521, 522, 524, 531],
+            raise_on_status=False,
+        )
+        adapter = HTTPAdapter(max_retries=retries)
+        self.session.mount("https://", adapter)
+        self.session.mount("http://", adapter)
         self.session.headers.update({
             "User-Agent": (
-                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                "(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+                "Mozilla/5.0 (X11; Linux x86_64; rv:130.0) Gecko/20100101 Firefox/130.0"
             ),
+            "Accept": "application/json, text/plain, */*",
             "Accept-Language": "en-US,en;q=0.9",
         })
         self.user_id: Optional[str] = None
@@ -164,58 +175,87 @@ class TikTokClient:
     def get_feed(self, count: int = 20, region: str = DEFAULT_REGION) -> List[Dict[str, Any]]:
         """
         Fetch public Trending / For You Page (FYP) videos without requiring login.
-        Uses high-speed REST feed endpoint.
+        Uses resilient REST feed endpoints with automatic retries and RAM caching.
         """
-        url = f"https://www.tikwm.com/api/feed/list?region={region}&count={count}"
-        try:
-            resp = requests.get(url, timeout=12, headers={"User-Agent": "Mozilla/5.0 (X11; Linux x86_64)"})
-            if resp.status_code == 200:
-                body = resp.json()
-                items = body.get("data", [])
-                results = []
-                for item in items:
-                    author = item.get("author", {})
-                    author_id = author.get("unique_id", "") or "creator"
-                    video_id = str(item.get("id") or item.get("video_id") or "")
-                    web_url = f"https://www.tiktok.com/@{author_id}/video/{video_id}"
+        endpoints = [
+            f"https://www.tikwm.com/api/feed/list?region={region}&count={count}",
+            f"https://tikwm.com/api/feed/list?region={region}&count={count}",
+            f"https://www.tikwm.com/api/feed/list?count={count}",
+        ]
 
-                    # Extract best cover
-                    cover = (
-                        item.get("cover")
-                        or item.get("origin_cover")
-                        or item.get("ai_dynamic_cover")
-                        or ""
-                    )
+        feed_cache_file = RAM_DIR / "cached_feed.json"
 
-                    # Extract best direct stream
-                    play_url = item.get("play") or item.get("wmplay") or web_url
+        for url in endpoints:
+            try:
+                resp = self.session.get(url, timeout=12)
+                if resp.status_code == 200:
+                    body = resp.json()
+                    items = body.get("data", [])
+                    if items:
+                        results = []
+                        for item in items:
+                            author = item.get("author", {})
+                            author_id = author.get("unique_id", "") or "creator"
+                            video_id = str(item.get("id") or item.get("video_id") or "")
+                            web_url = f"https://www.tiktok.com/@{author_id}/video/{video_id}"
 
-                    music_info = item.get("music_info", {})
-                    music_title = music_info.get("title") or "Original Sound"
-                    music_author = music_info.get("author") or author.get("nickname", "")
-                    music_url = music_info.get("play") or item.get("music") or ""
+                            # Extract best cover
+                            cover = (
+                                item.get("cover")
+                                or item.get("origin_cover")
+                                or item.get("ai_dynamic_cover")
+                                or ""
+                            )
 
-                    results.append({
-                        "id": video_id,
-                        "title": item.get("title", "").strip() or f"Video by @{author_id}",
-                        "author_id": author_id,
-                        "author_name": author.get("nickname") or author_id,
-                        "author_avatar": author.get("avatar", ""),
-                        "cover_url": cover,
-                        "play_url": play_url,
-                        "web_url": web_url,
-                        "music_title": f"{music_title} - {music_author}",
-                        "music_url": music_url,
-                        "duration": int(item.get("duration") or 0),
-                        "views": int(item.get("play_count") or 0),
-                        "likes": int(item.get("digg_count") or 0),
-                        "comments": int(item.get("comment_count") or 0),
-                        "shares": int(item.get("share_count") or 0),
-                        "source": "feed",
-                    })
-                return results
-        except Exception:
-            pass
+                            # Extract images if photo-mode post
+                            images = item.get("images") or []
+                            is_photo = bool(images)
+
+                            # Extract best direct stream
+                            play_url = item.get("play") or item.get("wmplay") or web_url
+
+                            music_info = item.get("music_info", {})
+                            music_title = music_info.get("title") or "Original Sound"
+                            music_author = music_info.get("author") or author.get("nickname", "")
+                            music_url = music_info.get("play") or item.get("music") or ""
+
+                            results.append({
+                                "id": video_id,
+                                "title": item.get("title", "").strip() or f"Video by @{author_id}",
+                                "author_id": author_id,
+                                "author_name": author.get("nickname") or author_id,
+                                "author_avatar": author.get("avatar", ""),
+                                "cover_url": cover,
+                                "play_url": play_url,
+                                "web_url": web_url,
+                                "music_title": f"{music_title} - {music_author}",
+                                "music_url": music_url,
+                                "duration": int(item.get("duration") or 0),
+                                "views": int(item.get("play_count") or 0),
+                                "likes": int(item.get("digg_count") or 0),
+                                "comments": int(item.get("comment_count") or 0),
+                                "shares": int(item.get("share_count") or 0),
+                                "images": images,
+                                "is_photo": is_photo,
+                                "source": "feed",
+                            })
+                        # Cache successful feed
+                        try:
+                            feed_cache_file.write_text(json.dumps(results))
+                        except Exception:
+                            pass
+                        return results
+            except Exception:
+                continue
+
+        # If network failed on all endpoints, fall back to cached feed if available
+        if feed_cache_file.exists():
+            try:
+                cached = json.loads(feed_cache_file.read_text())
+                if isinstance(cached, list) and cached:
+                    return cached
+            except Exception:
+                pass
 
         return []
 
@@ -295,43 +335,47 @@ class TikTokClient:
         if not clean_url:
             return None
 
-        # Try fast TikWM POST resolution
-        try:
-            resp = requests.post(
-                "https://www.tikwm.com/api/",
-                data={"url": clean_url},
-                timeout=10,
-                headers={"User-Agent": "Mozilla/5.0 (X11; Linux x86_64)"}
-            )
-            if resp.status_code == 200:
-                body = resp.json()
-                if body.get("code") == 0 and "data" in body:
-                    data = body["data"]
-                    author = data.get("author", {})
-                    author_id = author.get("unique_id", "") or "creator"
-                    video_id = str(data.get("id") or "")
-                    music_info = data.get("music_info", {})
+        # Try fast TikWM POST resolution with retry session
+        for post_api in ("https://www.tikwm.com/api/", "https://tikwm.com/api/"):
+            try:
+                resp = self.session.post(
+                    post_api,
+                    data={"url": clean_url},
+                    timeout=10,
+                )
+                if resp.status_code == 200:
+                    body = resp.json()
+                    if body.get("code") == 0 and "data" in body:
+                        data = body["data"]
+                        images = data.get("images") or []
+                        is_photo = bool(images)
+                        author = data.get("author", {})
+                        author_id = author.get("unique_id", "") or "creator"
+                        video_id = str(data.get("id") or "")
+                        music_info = data.get("music_info", {})
 
-                    return {
-                        "id": video_id,
-                        "title": data.get("title", "").strip() or f"Video by @{author_id}",
-                        "author_id": author_id,
-                        "author_name": author.get("nickname") or author_id,
-                        "author_avatar": author.get("avatar", ""),
-                        "cover_url": data.get("cover") or data.get("origin_cover") or "",
-                        "play_url": data.get("play") or data.get("wmplay") or clean_url,
-                        "web_url": clean_url,
-                        "music_title": music_info.get("title") or "Original Sound",
-                        "music_url": music_info.get("play") or "",
-                        "duration": int(data.get("duration") or 0),
-                        "views": int(data.get("play_count") or 0),
-                        "likes": int(data.get("digg_count") or 0),
-                        "comments": int(data.get("comment_count") or 0),
-                        "shares": int(data.get("share_count") or 0),
-                        "source": "direct",
-                    }
-        except Exception:
-            pass
+                        return {
+                            "id": video_id,
+                            "title": data.get("title", "").strip() or f"Video by @{author_id}",
+                            "author_id": author_id,
+                            "author_name": author.get("nickname") or author_id,
+                            "author_avatar": author.get("avatar", ""),
+                            "cover_url": data.get("cover") or data.get("origin_cover") or "",
+                            "play_url": data.get("play") or data.get("wmplay") or clean_url,
+                            "web_url": clean_url,
+                            "music_title": music_info.get("title") or "Original Sound",
+                            "music_url": music_info.get("play") or "",
+                            "duration": int(data.get("duration") or 0),
+                            "views": int(data.get("play_count") or 0),
+                            "likes": int(data.get("digg_count") or 0),
+                            "comments": int(data.get("comment_count") or 0),
+                            "shares": int(data.get("share_count") or 0),
+                            "images": images,
+                            "is_photo": is_photo,
+                            "source": "direct",
+                        }
+            except Exception:
+                continue
 
         # Fallback to yt-dlp info extractor
         if yt_dlp:
