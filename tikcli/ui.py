@@ -563,7 +563,8 @@ class TerminalUI:
         else:
             # Controls and Dynamic Status bar
             shortcuts = (
-                f"{BOLD}[Enter]{RESET} Watch (Loop/Scroll)  "
+                f"{BOLD}[Enter]{RESET} Watch ({self.vo_driver.upper()})  "
+                f"{BOLD}[:vo]{RESET} Toggle VO  "
                 f"{BOLD}[:d]{RESET} Download  "
                 f"{BOLD}[:m]{RESET} Audio  "
                 f"{BOLD}[/]{RESET} Search/@  "
@@ -682,11 +683,16 @@ class TerminalUI:
             elif cmd.startswith("user ") or cmd.startswith("creator "):
                 user = cmd.split(" ", 1)[1]
                 self.load_creator(user)
-            elif cmd.startswith("vo "):
-                driver = cmd.split(" ", 1)[1].strip().lower()
+            elif cmd == "vo" or cmd.startswith("vo "):
+                parts = cmd.split(" ", 1)
+                if len(parts) == 2:
+                    driver = parts[1].strip().lower()
+                else:
+                    driver = "tct" if self.vo_driver == "sixel" else "sixel"
                 if driver in ("tct", "sixel"):
                     self.vo_driver = driver
-                    self.set_status(f"Video driver set to '{driver.upper()}'.", GREEN)
+                    desc = "24-bit TrueColor" if driver == "tct" else "Sixel High-Res"
+                    self.set_status(f"Video driver switched to {driver.upper()} ({desc}).", GREEN)
                 else:
                     self.set_status("Invalid driver. Use ':vo tct' or ':vo sixel'.", RED)
             elif cmd == "login":
@@ -695,7 +701,7 @@ class TerminalUI:
                 self.client.logout()
                 self.set_status("Logged out. Switched to Guest Mode.", YELLOW)
             elif cmd == "help":
-                self.set_status("Keys: Enter=play, :d=download, :m=audio, :vo tct|sixel, /=search, :q=quit", CYAN)
+                self.set_status("Keys: Enter=play, :vo=toggle sixel/tct, :d=download, :m=audio, /=search, :q=quit", CYAN)
             elif cmd:
                 self.set_status(f"Unknown command: :{cmd}", RED)
 

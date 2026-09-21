@@ -1,5 +1,6 @@
 import os
 import sys
+import re
 import time
 import shutil
 import subprocess
@@ -40,6 +41,48 @@ def fetch_bytes_in_ram(url: str, timeout: int = 15) -> Optional[bytes]:
     except Exception:
         pass
     return None
+
+
+def get_terminal_grid_size() -> Tuple[int, int]:
+    """Get accurate terminal column and line count, with Sway window fallback."""
+    try:
+        for fd in (1, 0, 2):
+            try:
+                size = os.get_terminal_size(fd)
+                if size.columns > 40 and size.lines > 10:
+                    return size.columns, size.lines
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    if os.environ.get("SWAYSOCK"):
+        try:
+            res = subprocess.run(["swaymsg", "-t", "get_tree"], capture_output=True, text=True, timeout=1)
+            import json
+            tree = json.loads(res.stdout)
+            def find_foot(node):
+                if node.get("app_id") == "foot" and node.get("visible", True):
+                    return node
+                for c in node.get("nodes", []) + node.get("floating_nodes", []):
+                    f = find_foot(c)
+                    if f:
+                        return f
+                return None
+            foot_node = find_foot(tree)
+            if foot_node:
+                w_rect = foot_node.get("window_rect") or foot_node.get("rect")
+                if w_rect and w_rect.get("width", 0) > 0 and w_rect.get("height", 0) > 0:
+                    w = int(w_rect["width"]) - 20
+                    h = int(w_rect["height"]) - 20
+                    cols = max(80, int(w / 9.5))
+                    rows = max(24, int(h / 20.0))
+                    return cols, rows
+        except Exception:
+            pass
+
+    size = shutil.get_terminal_size((80, 24))
+    return size.columns, size.lines
 
 
 def get_terminal_pixel_size() -> Tuple[int, int]:
@@ -223,38 +266,39 @@ end)
 """
     tracker_lua.write_text(lua_code)
 
-    term_size = shutil.get_terminal_size((80, 24))
-    cols = term_size.columns
-    rows = term_size.lines
+    cols, rows = get_terminal_grid_size()
     pixel_w, pixel_h = get_terminal_pixel_size()
 
     cmd = [
         MPV_PATH,
         "--no-config",
+        "--terminal=yes",              # Enables interactive keyboard stdin reader
+        "--input-terminal=yes",        # Binds keyboard controls directly to stdin
         "--force-window=no",
-        "--loop-file=inf",             # Loop current video indefinitely!
-        "--loop-playlist=inf",         # Continuous playlist navigation
+        "--loop-file=inf",             # Continuous loop on each video!
+        "--loop-playlist=inf",         # Continuous next/prev cycling
         f"--playlist={m3u_file}",
         f"--playlist-start={m3u_start_idx}",
         f"--input-conf={input_conf_file}",
         f"--script={tracker_lua}",
-        "--really-quiet",              # Prevent stdout text from interrupting and corrupting video frames
-        "--terminal=no",               # Never interleave stdout terminal text with graphic escape sequences
-        "--no-term-osd-bar",
+        "--term-osd-bar=no",           # Suppress terminal text seekbar
+        "--term-status-msg=",          # Suppress terminal status line spam
+        "--msg-level=all=no",          # Suppress terminal log output
         "--http-header-fields-append=Referer: https://www.tiktok.com/",
         "--http-header-fields-append=User-Agent: Mozilla/5.0 (X11; Linux x86_64)",
     ]
 
     if selected_driver == "sixel":
-        # Dynamic high-fidelity Sixel graphics: no fixed palette, no dithering grains, full vertical height
+        # Dynamic high-fidelity Sixel graphics: no fixed palette, full terminal dimensions
         cmd.extend([
             "--vo=sixel",
+            f"--vo-sixel-cols={cols}",
+            f"--vo-sixel-rows={rows}",
             f"--vo-sixel-width={pixel_w}",
             f"--vo-sixel-height={pixel_h}",
             "--vo-sixel-fixedpalette=no",   # Dynamic adaptive palette: eliminates Windows 98 8-bit VGA look!
             "--vo-sixel-threshold=-1",      # Per-frame palette optimization for maximum color fidelity
-            "--vo-sixel-reqcolors=256",     # Full 256 colors per frame
-            "--vo-sixel-dither=none",       # Eradicate all dithering grain noise!
+            "--vo-sixel-reqcolors=256",     # Full 256 dynamic colors per frame
             "--vo-sixel-buffered=yes",
         ])
     else:
@@ -267,8 +311,9 @@ end)
             "--vo-tct-256=no",
         ])
 
-    # Save alternate screen buffer and show cursor
-    sys.stdout.write("\033[?1049h\033[2J\033[H\033[?25h")
+    # Disable mouse tracking before mpv so mouse escapes do not flood stdin,
+    # save alternate screen buffer, clear screen, and show cursor
+    sys.stdout.write("\033[?1000l\033[?1006l\033[?1049h\033[2J\033[H\033[?25h")
     sys.stdout.flush()
 
     last_index = start_index
@@ -294,7 +339,8 @@ end)
     except Exception as e:
         msg = f"Playback error: {e}"
     finally:
-        sys.stdout.write("\033[?1049l\033[2J\033[H\033[?25l")
+        # Restore normal screen buffer, clear, hide cursor, and re-enable SGR mouse tracking
+        sys.stdout.write("\033[?1049l\033[2J\033[H\033[?25l\033[?1000h\033[?1006h")
         sys.stdout.flush()
 
     return last_index, msg
