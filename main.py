@@ -14,6 +14,7 @@ def main():
     parser.add_argument("--play", type=str, help="Directly play a TikTok video URL in external MPV window")
     parser.add_argument("--vo", choices=["mpv"], default="mpv", help="Video output driver: 'mpv' (external hardware-accelerated window)")
     parser.add_argument("--user", type=str, help="Launch TUI directly on a specific creator's profile (@username)")
+    parser.add_argument("--search", "-s", type=str, help="Launch TUI directly with keyword search (e.g. 'pakistani videos', 'naat')")
     parser.add_argument("--session", type=str, help="Authenticate directly with a TikTok sessionid cookie")
     parser.add_argument("--ttwid", type=str, help="Optional ttwid cookie for authentication")
     parser.add_argument("--logout", action="store_true", help="Remove saved session credentials")
@@ -65,12 +66,22 @@ def main():
             print(f" - {v.get('title')} ({v.get('web_url')})")
         return
 
+    if args.search and args.dry_run:
+        print(f"Searching TikTok for '{args.search}'...")
+        videos = client.search_videos(args.search, count=5)
+        print(f"Found {len(videos)} videos:")
+        for v in videos:
+            print(f" - @{v.get('author_id')}: {v.get('title')} ({v.get('web_url')})")
+        return
+
     # Default: launch interactive TUI
     ui = TerminalUI(client)
     if args.vo:
         ui.vo_driver = args.vo
     if args.user:
         ui.load_creator(args.user)
+    elif args.search:
+        ui.load_search(args.search)
     ui.run()
 
 

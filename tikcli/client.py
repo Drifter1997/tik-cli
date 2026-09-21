@@ -3,6 +3,8 @@ import json
 import time
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Tuple
+import re
+import urllib.parse
 import requests
 from urllib3.util import Retry
 from requests.adapters import HTTPAdapter
@@ -325,6 +327,198 @@ class TikTokClient:
             pass
 
         return []
+
+    def search_videos(self, query: str, count: int = 20) -> List[Dict[str, Any]]:
+        """
+        Search TikTok videos by keyword, creator (@handle), or direct URL.
+        Supports:
+        1. General keyword searches (e.g. "pakistani videos", "naat", "shaman songs")
+           via multi-source aggregation (Urlebird & search fallback).
+        2. Creator searches (@username or username).
+        3. Direct video URL resolution.
+        """
+        clean_q = query.strip()
+        if not clean_q:
+            return []
+
+        # 1. Direct Video URL
+        if clean_q.startswith("http://") or clean_q.startswith("https://"):
+            single = self.resolve_video_url(clean_q)
+            return [single] if single else []
+
+        # 2. Creator Handle (@username)
+        if clean_q.startswith("@"):
+            return self.get_user_videos(clean_q.lstrip("@"), count=count)
+
+        # 3. General Keyword Search
+        # Primary: Urlebird Search (fast, public, unblocked, provides titles, covers, likes, plays)
+        items = self._search_urlebird(clean_q, count=count)
+        if items:
+            return items
+
+        # Fallback 1: Yahoo search for TikTok videos
+        items = self._search_yahoo(clean_q, count=count)
+        if items:
+            return items
+
+        # Fallback 2: Creator search if single word
+        if " " not in clean_q:
+            creator_res = self.get_user_videos(clean_q, count=count)
+            if creator_res:
+                return creator_res
+
+        return []
+
+    def _search_urlebird(self, query: str, count: int = 20) -> List[Dict[str, Any]]:
+        """Scrape video search cards from Urlebird."""
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            ),
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        }
+
+        def parse_stat(s: str) -> int:
+            if not s:
+                return 0
+            s = s.strip().upper()
+            try:
+                if s.endswith("M"):
+                    return int(float(s[:-1]) * 1_000_000)
+                if s.endswith("K"):
+                    return int(float(s[:-1]) * 1_000)
+                return int(float(s))
+            except Exception:
+                return 0
+
+        items: List[Dict[str, Any]] = []
+        seen_ids = set()
+        pages = 1 if count <= 10 else 2
+
+        for page in range(1, pages + 1):
+            url = f"https://urlebird.com/search/?q={urllib.parse.quote(query)}"
+            if page > 1:
+                url += f"&p={page}"
+            try:
+                resp = self.session.get(url, headers=headers, timeout=10)
+                if resp.status_code != 200:
+                    break
+
+                parts = resp.text.split('<div class="thumb')
+                for c in parts[1:]:
+                    m_vid = re.search(
+                        r'href="[^"]*/video/(?:[^"]*?-)?(\d+)/"><span>(.*?)</span></a>',
+                        c,
+                        re.DOTALL,
+                    )
+                    if not m_vid:
+                        continue
+                    video_id = m_vid.group(1)
+                    if video_id in seen_ids:
+                        continue
+                    seen_ids.add(video_id)
+
+                    m_author = re.search(r'href="[^"]*/user/([^/"]+)/">@?([^<]+)</a>', c)
+                    author_id = m_author.group(1) if m_author else "creator"
+                    author_name = m_author.group(2) if m_author else author_id
+
+                    raw_caption = re.sub(r'<[^>]+>', '', m_vid.group(2)).strip()
+                    caption = (
+                        raw_caption.replace('&amp;', '&')
+                        .replace('&quot;', '"')
+                        .replace('&#39;', "'")
+                        .replace('&bull;', '•')
+                    )
+
+                    m_thumb = re.search(r'class="img">\s*<img src="([^"]+)"', c, re.DOTALL)
+                    cover_url = m_thumb.group(1) if m_thumb else ""
+
+                    m_play = re.search(r'<i class="fas fa-play"[^>]*></i>\s*([0-9\.]+[KMB]?)', c)
+                    views = parse_stat(m_play.group(1)) if m_play else 0
+
+                    m_heart = re.search(r'<i class="fas fa-heart"[^>]*></i>\s*([0-9\.]+[KMB]?)', c)
+                    likes = parse_stat(m_heart.group(1)) if m_heart else 0
+
+                    m_comment = re.search(r'<i class="fas fa-comment"[^>]*></i>\s*([0-9\.]+[KMB]?)', c)
+                    comments = parse_stat(m_comment.group(1)) if m_comment else 0
+
+                    web_url = f"https://www.tiktok.com/@{author_id}/video/{video_id}"
+
+                    items.append({
+                        "id": video_id,
+                        "title": caption or f"Video by @{author_id}",
+                        "author_id": author_id,
+                        "author_name": author_name,
+                        "author_avatar": "",
+                        "cover_url": cover_url,
+                        "play_url": web_url,
+                        "web_url": web_url,
+                        "music_title": "Original Sound",
+                        "music_url": "",
+                        "duration": 0,
+                        "views": views,
+                        "likes": likes,
+                        "comments": comments,
+                        "shares": 0,
+                        "images": [],
+                        "is_photo": False,
+                        "source": "search",
+                    })
+                    if len(items) >= count:
+                        break
+            except Exception:
+                break
+            if len(items) >= count:
+                break
+
+        return items
+
+    def _search_yahoo(self, query: str, count: int = 20) -> List[Dict[str, Any]]:
+        """Fallback search using Yahoo search for TikTok video IDs."""
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            ),
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        }
+
+        patterns = [
+            f"site:tiktok.com/video/ {query}",
+            f"site:tiktok.com/@ {query}",
+        ]
+        video_ids = []
+        seen = set()
+        for p in patterns:
+            try:
+                url = f"https://search.yahoo.com/search?p={urllib.parse.quote(p)}"
+                resp = self.session.get(url, headers=headers, timeout=8)
+                if resp.status_code == 200:
+                    ru = re.findall(r'/RU=([^/]+)/', resp.text)
+                    for encoded_u in ru:
+                        u = urllib.parse.unquote(encoded_u)
+                        if "tiktok.com" in u:
+                            m = re.search(r'/(?:video|photo)/(\d+)', u)
+                            if m:
+                                vid = m.group(1)
+                                if vid not in seen:
+                                    seen.add(vid)
+                                    video_ids.append(vid)
+                                    if len(video_ids) >= count:
+                                        break
+            except Exception:
+                pass
+            if len(video_ids) >= count:
+                break
+
+        items = []
+        for vid in video_ids[:min(5, count)]:
+            resolved = self.resolve_video_url(f"https://www.tiktok.com/embed/v2/{vid}")
+            if resolved:
+                resolved["source"] = "search"
+                items.append(resolved)
+        return items
 
     def resolve_video_url(self, url: str) -> Optional[Dict[str, Any]]:
         """

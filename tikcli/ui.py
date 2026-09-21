@@ -62,6 +62,31 @@ def strip_ansi(text: str) -> str:
     return ANSI_REGEX.sub('', text)
 
 
+def truncate_ansi(s: str, max_width: int) -> str:
+    """Safely truncate text containing ANSI codes so visible length <= max_width."""
+    if max_width <= 0:
+        return ""
+    vis_len = 0
+    res = []
+    i = 0
+    n = len(s)
+    while i < n:
+        if s[i] == '\x1b':
+            m = ANSI_REGEX.match(s, i)
+            if m:
+                res.append(m.group(0))
+                i += len(m.group(0))
+                continue
+        if vis_len >= max_width:
+            break
+        res.append(s[i])
+        vis_len += 1
+        i += 1
+    if vis_len >= max_width and '\x1b[' in s:
+        res.append("\033[0m")
+    return "".join(res)
+
+
 class RawTerminal:
     """Context manager for terminal raw/cbreak mode with alternate screen buffer & SGR mouse tracking."""
     def __init__(self, enable_mouse: bool = True):
@@ -73,8 +98,8 @@ class RawTerminal:
         if self.fd is not None:
             self.old_settings = termios.tcgetattr(self.fd)
             tty.setcbreak(self.fd)
-            # Enter alternate screen buffer, hide cursor, enable mouse tracking
-            sys.stdout.write("\033[?1049h\033[?25l")
+            # Enter alternate screen buffer, hide cursor, disable auto-wrap, enable mouse tracking
+            sys.stdout.write("\033[?1049h\033[?25l\033[?7l")
             if self.enable_mouse:
                 sys.stdout.write("\033[?1000h\033[?1006h")
             sys.stdout.write("\033[2J\033[H")
@@ -85,8 +110,8 @@ class RawTerminal:
         if self.fd is not None:
             if self.enable_mouse:
                 sys.stdout.write("\033[?1000l\033[?1006l")
-            # Show cursor, leave alternate screen buffer, reset attributes
-            sys.stdout.write("\033[?25h\033[?1049l\033[0m")
+            # Show cursor, restore auto-wrap, leave alternate screen buffer, reset attributes
+            sys.stdout.write("\033[?25h\033[?7h\033[?1049l\033[0m")
             sys.stdout.flush()
             if self.old_settings is not None:
                 termios.tcsetattr(self.fd, termios.TCSADRAIN, self.old_settings)
@@ -235,10 +260,15 @@ class TerminalUI:
         self.running = True
 
         # Navigation state
-        self.mode = "feed"  # "feed", "creator", "dms"
+        self.mode = "feed"  # "feed", "search", "creator", "dms"
         self.feed_items: List[Dict[str, Any]] = []
         self.feed_index = 0
         self.feed_scroll_offset = 0
+
+        self.search_items: List[Dict[str, Any]] = []
+        self.search_index = 0
+        self.search_scroll_offset = 0
+        self.current_search_query = ""
 
         self.creator_items: List[Dict[str, Any]] = []
         self.creator_index = 0
@@ -248,6 +278,8 @@ class TerminalUI:
         self.dms_items: List[Dict[str, Any]] = []
         self.dms_index = 0
         self.dms_scroll_offset = 0
+
+        self.last_content_height = 15
 
         # Command & Search input prompt state
         self.input_mode = False
@@ -270,7 +302,7 @@ class TerminalUI:
         atexit.register(self._cleanup_terminal)
 
     def _cleanup_terminal(self):
-        sys.stdout.write("\033[?1000l\033[?1006l\033[?25h\033[?1049l\033[0m")
+        sys.stdout.write("\033[?1000l\033[?1006l\033[?25h\033[?7h\033[?1049l\033[0m")
         sys.stdout.flush()
 
     def get_scroll_offset(self, selected: int, current_offset: int, height: int, total_items: int) -> int:
@@ -345,7 +377,8 @@ class TerminalUI:
         if items:
             self.feed_items = items
             self.feed_index = min(self.feed_index, len(self.feed_items) - 1)
-            self.feed_scroll_offset = self.get_scroll_offset(self.feed_index, self.feed_scroll_offset, 20, len(items))
+            h = getattr(self, "last_content_height", 15)
+            self.feed_scroll_offset = self.get_scroll_offset(self.feed_index, self.feed_scroll_offset, h, len(items))
             self.set_status(f"Loaded {len(items)} trending videos.", GREEN)
         else:
             if not self.feed_items:
@@ -372,6 +405,25 @@ class TerminalUI:
             self.set_status(f"No videos found for @{clean_user}.", YELLOW)
         self.force_clear = True
 
+    def load_search(self, query: str):
+        """Search TikTok videos by keyword, creator (@handle), or URL."""
+        clean_q = query.strip()
+        if not clean_q:
+            return
+        self.current_search_query = clean_q
+        self.set_status(f"Searching TikTok for '{clean_q}'...", CYAN)
+        self.draw()
+        items = self.client.search_videos(clean_q, count=25)
+        if items:
+            self.search_items = items
+            self.search_index = 0
+            self.search_scroll_offset = 0
+            self.mode = "search"
+            self.set_status(f"Loaded {len(items)} videos for '{clean_q}'.", GREEN)
+        else:
+            self.set_status(f"No videos found for '{clean_q}'.", YELLOW)
+        self.force_clear = True
+
     def load_direct_url(self, url: str):
         """Resolve a direct TikTok video URL."""
         self.set_status("Resolving video URL...", CYAN)
@@ -394,32 +446,37 @@ class TerminalUI:
     def draw(self):
         """Render complete screen buffer without terminal scrolling."""
         term_size = shutil.get_terminal_size((80, 24))
-        cols = term_size.columns
-        lines = term_size.lines
+        cols = max(40, term_size.columns)
+        lines = max(10, term_size.lines)
 
-        buf = []
+        buf = ["\033[?25l"]  # Ensure cursor stays hidden during render
         if getattr(self, "force_clear", False):
             buf.append("\033[2J")
             self.force_clear = False
-        buf.append("\033[H")  # Move to top-left
 
         # 1. Header (3 lines)
         header_lines = self.render_header(cols)
 
-        # 2. Main Content Area (lines - 7 so total screen never touches bottom row)
-        avail_height = max(5, lines - len(header_lines) - 4)
-        content_lines = self.render_content(cols, avail_height)
-
-        # 3. Footer / Status bar (3 lines)
+        # 2. Footer / Status bar (2 or 3 lines)
         footer_lines = self.render_footer(cols)
 
-        all_lines = []
-        for line in header_lines + content_lines + footer_lines:
-            clean = line.rstrip("\r\n")
-            all_lines.append(clean)
+        # 3. Main Content Area (budget remaining lines exactly)
+        avail_height = max(3, lines - len(header_lines) - len(footer_lines))
+        self.last_content_height = avail_height
+        content_lines = self.render_content(cols, avail_height)
 
-        # Output with \r\n and NO trailing newline to prevent any terminal scrolling
-        buf.append("\r\n".join(all_lines))
+        all_lines = header_lines + content_lines + footer_lines
+
+        # Write lines directly to row coordinates with line clearing.
+        # This completely eliminates scroll-overflow, buffer ghosting, and cursor displacement.
+        for r, line in enumerate(all_lines[:lines], 1):
+            clean = line.rstrip("\r\n")
+            buf.append(f"\033[{r};1H\033[2K{clean}")
+
+        # Clear any remaining lines below the footer up to terminal boundary
+        for r in range(len(all_lines) + 1, lines + 1):
+            buf.append(f"\033[{r};1H\033[2K")
+
         sys.stdout.write("".join(buf))
         sys.stdout.flush()
 
@@ -436,16 +493,20 @@ class TerminalUI:
 
         title_bar = f" {logo} {GRAY}│{RESET} {DIM}Terminal TikTok Client{RESET}"
         gap = width - len(strip_ansi(title_bar)) - len(strip_ansi(auth_badge)) - 2
-        lines.append(f"{BG_HEADER}{title_bar}{' ' * max(1, gap)}{auth_badge} {RESET}")
+        header_line = f"{BG_HEADER}{title_bar}{' ' * max(1, gap)}{auth_badge} {RESET}"
+        lines.append(truncate_ansi(header_line, width - 1))
 
         # Mode Tab Bar
-        tab_feed = f"{BOLD}{CYAN}[1] 🔥 For You / Trending{RESET}" if self.mode == "feed" else f"{GRAY}[1] For You{RESET}"
-        tab_creator = f"{BOLD}{CYAN}[2] 👤 Creator (@{self.current_creator}){RESET}" if self.mode == "creator" else f"{GRAY}[2] Creator{RESET}"
-        tab_dms = f"{BOLD}{CYAN}[3] 💬 Direct Messages{RESET}" if self.mode == "dms" else f"{GRAY}[3] Messages{RESET}"
+        tab_feed = f"{BOLD}{CYAN}[1] 🔥 For You{RESET}" if self.mode == "feed" else f"{GRAY}[1] For You{RESET}"
+        q_label = f" (\"{self.current_search_query[:10]}…\")" if len(self.current_search_query) > 10 else (f" (\"{self.current_search_query}\")" if self.current_search_query else "")
+        tab_search = f"{BOLD}{CYAN}[2] 🔍 Search{q_label}{RESET}" if self.mode == "search" else f"{GRAY}[2] Search{q_label}{RESET}"
+        c_label = f" (@{self.current_creator[:10]})" if self.current_creator else ""
+        tab_creator = f"{BOLD}{CYAN}[3] 👤 Creator{c_label}{RESET}" if self.mode == "creator" else f"{GRAY}[3] Creator{c_label}{RESET}"
+        tab_dms = f"{BOLD}{CYAN}[4] 💬 Messages{RESET}" if self.mode == "dms" else f"{GRAY}[4] Messages{RESET}"
 
-        tabs_str = f"  {tab_feed}    {tab_creator}    {tab_dms}"
-        lines.append(tabs_str)
-        lines.append(f"{GRAY}{'─' * max(1, width - 1)}{RESET}")
+        tabs_str = f"  {tab_feed}   {tab_search}   {tab_creator}   {tab_dms}"
+        lines.append(truncate_ansi(tabs_str, width - 1))
+        lines.append(f"{GRAY}{'─' * max(1, width - 2)}{RESET}")
         return lines
 
     def render_content(self, width: int, height: int) -> List[str]:
@@ -453,11 +514,20 @@ class TerminalUI:
             return self.render_dms(width, height)
 
         # Split into Left List (52%) and Right Preview (48%)
-        left_w = max(35, int(width * 0.52))
-        right_w = max(30, width - left_w - 3)
+        # Clamped so left_w + 3 + right_w <= width - 1 (never hits right margin)
+        inner_w = max(30, width - 4)
+        left_w = max(20, int(inner_w * 0.52))
+        right_w = max(20, inner_w - left_w)
 
-        items = self.feed_items if self.mode == "feed" else self.creator_items
-        selected_idx = self.feed_index if self.mode == "feed" else self.creator_index
+        if self.mode == "feed":
+            items = self.feed_items
+            selected_idx = self.feed_index
+        elif self.mode == "search":
+            items = self.search_items
+            selected_idx = self.search_index
+        else:
+            items = self.creator_items
+            selected_idx = self.creator_index
 
         left_lines = self.render_video_list(items, selected_idx, left_w, height)
         selected_video = items[selected_idx] if (items and 0 <= selected_idx < len(items)) else None
@@ -467,26 +537,42 @@ class TerminalUI:
         for i in range(height):
             l_str = left_lines[i] if i < len(left_lines) else " " * left_w
             r_str = right_lines[i] if i < len(right_lines) else " " * right_w
-            combined.append(f"{l_str} {GRAY}│{RESET} {r_str}\033[K")
+            row_str = f"{l_str} {GRAY}│{RESET} {r_str}"
+            combined.append(truncate_ansi(row_str, width - 1))
 
         return combined
 
     def render_video_list(self, items: List[Dict[str, Any]], selected: int, width: int, height: int) -> List[str]:
         lines = []
         if not items:
-            msg1 = f"  {CYAN}{BOLD}⏳ Connecting to TikTok...{RESET}"
-            msg2 = f"  {DIM}Fetching trending videos (Press 'r' to retry, '/' to search creator){RESET}"
-            lines.append(f"{msg1}{' ' * max(0, width - len(strip_ansi(msg1)))}")
-            lines.append(f"{msg2}{' ' * max(0, width - len(strip_ansi(msg2)))}")
+            if self.mode == "search":
+                msg1 = f"  {CYAN}{BOLD}🔍 Search TikTok Videos{RESET}"
+                msg2 = f"  {DIM}Press '/' to search (e.g. pakistani videos, naat, shaman songs, @creator){RESET}"
+            elif self.mode == "creator":
+                msg1 = f"  {CYAN}{BOLD}👤 Creator Videos (@{self.current_creator}){RESET}"
+                msg2 = f"  {DIM}Press '/' to search another creator (@username){RESET}"
+            else:
+                msg1 = f"  {CYAN}{BOLD}⏳ Connecting to TikTok...{RESET}"
+                msg2 = f"  {DIM}Fetching trending videos (Press 'r' to retry, '/' to search){RESET}"
+            lines.append(truncate_ansi(f"{msg1}{' ' * max(0, width - len(strip_ansi(msg1)))}", width))
+            lines.append(truncate_ansi(f"{msg2}{' ' * max(0, width - len(strip_ansi(msg2)))}", width))
             while len(lines) < height:
                 lines.append(" " * width)
             return lines
 
         # Viewport scrolling offset: keeps cursor inside window and only scrolls when hitting borders
-        current_offset = self.feed_scroll_offset if self.mode == "feed" else self.creator_scroll_offset
+        if self.mode == "feed":
+            current_offset = self.feed_scroll_offset
+        elif self.mode == "search":
+            current_offset = self.search_scroll_offset
+        else:
+            current_offset = self.creator_scroll_offset
+
         scroll_start = self.get_scroll_offset(selected, current_offset, height, len(items))
         if self.mode == "feed":
             self.feed_scroll_offset = scroll_start
+        elif self.mode == "search":
+            self.search_scroll_offset = scroll_start
         else:
             self.creator_scroll_offset = scroll_start
 
@@ -498,33 +584,34 @@ class TerminalUI:
 
             marker = f"{CYAN}▶{RESET}" if is_active else " "
             author = f"@{item.get('author_id', 'unknown')[:14]}"
-            dur = format_duration(item.get("duration", 0))
+            dur = format_duration(item.get("duration", 0)) if item.get("duration") else ""
             likes = format_count(item.get("likes", 0))
 
             is_photo = item.get("is_photo", False)
             photo_tag = f"{YELLOW}[📸 Photo]{RESET} " if is_photo else ""
 
-            title = item.get("title", "").replace("\n", " ")
-            extra_len = len(author) + len(dur) + len(likes) + (10 if is_photo else 0) + 12
-            max_title_len = max(10, width - extra_len)
+            title = item.get("title", "").replace("\n", " ").strip()
+            extra_len = len(author) + (len(dur) + 1 if dur else 0) + len(likes) + (10 if is_photo else 0) + 10
+            max_title_len = max(8, width - extra_len)
             if len(title) > max_title_len:
                 title = title[:max_title_len - 1] + "…"
 
+            dur_str = f" {DIM}{dur}{RESET}" if dur else ""
             if is_active:
                 row = (
                     f"{marker} {photo_tag}{BOLD}{WHITE}{title}{RESET} "
-                    f"{CYAN}{author}{RESET} {RED}♥{likes}{RESET} {DIM}{dur}{RESET}"
+                    f"{CYAN}{author}{RESET} {RED}♥{likes}{RESET}{dur_str}"
                 )
                 vis_len = len(strip_ansi(row))
                 bg_colored = f"{BG_ACTIVE}{row}{' ' * max(0, width - vis_len)}{RESET}"
-                lines.append(bg_colored)
+                lines.append(truncate_ansi(bg_colored, width))
             else:
                 row = (
                     f"{marker} {photo_tag}{LIGHT_GRAY}{title}{RESET} "
-                    f"{GRAY}{author}{RESET} {DIM}♥{likes} {dur}{RESET}"
+                    f"{GRAY}{author}{RESET} {DIM}♥{likes}{RESET}{dur_str}"
                 )
                 vis_len = len(strip_ansi(row))
-                lines.append(f"{row}{' ' * max(0, width - vis_len)}")
+                lines.append(truncate_ansi(f"{row}{' ' * max(0, width - vis_len)}", width))
 
         while len(lines) < height:
             lines.append(" " * width)
@@ -662,26 +749,27 @@ class TerminalUI:
 
     def render_footer(self, width: int) -> List[str]:
         lines = []
-        lines.append(f"{GRAY}{'─' * max(1, width - 1)}{RESET}")
+        lines.append(f"{GRAY}{'─' * max(1, width - 2)}{RESET}")
 
         if self.input_mode:
             # Active command/search input bar
             prompt_str = f"{CYAN}{BOLD}{self.input_prompt}{RESET}{self.input_buffer}{CYAN}█{RESET}"
-            lines.append(prompt_str)
+            lines.append(truncate_ansi(prompt_str, width - 1))
         else:
             # Controls and Dynamic Status bar
             shortcuts = (
                 f"{BOLD}[Enter]{RESET} Watch (MPV)  "
-                f"{BOLD}[t]{RESET} Cover/Photos (IMV)  "
-                f"{BOLD}[:d]{RESET} Download  "
-                f"{BOLD}[:m]{RESET} Audio  "
+                f"{BOLD}[t]{RESET} Cover (IMV)  "
                 f"{BOLD}[/]{RESET} Search  "
                 f"{BOLD}[Tab]{RESET} Tabs  "
+                f"{BOLD}[:d]{RESET} Save  "
+                f"{BOLD}[:m]{RESET} Audio  "
                 f"{BOLD}[:q]{RESET} Quit"
             )
             status = f"{self.status_color}{self.status_message}{RESET}"
-            lines.append(shortcuts)
-            lines.append(f"{BG_STATUS} {status}{' ' * max(0, width - len(strip_ansi(status)) - 2)} {RESET}")
+            lines.append(truncate_ansi(shortcuts, width - 1))
+            status_bar = f"{BG_STATUS} {truncate_ansi(status, width - 4)}{' ' * max(0, width - len(strip_ansi(status)) - 2)} {RESET}"
+            lines.append(truncate_ansi(status_bar, width - 1))
 
         return lines
 
@@ -698,6 +786,8 @@ class TerminalUI:
         if key in ("UP", "k"):
             if self.mode == "feed" and self.feed_items:
                 self.feed_index = max(0, self.feed_index - 1)
+            elif self.mode == "search" and self.search_items:
+                self.search_index = max(0, self.search_index - 1)
             elif self.mode == "creator" and self.creator_items:
                 self.creator_index = max(0, self.creator_index - 1)
             elif self.mode == "dms" and self.dms_items:
@@ -705,6 +795,8 @@ class TerminalUI:
         elif key in ("DOWN", "j"):
             if self.mode == "feed" and self.feed_items:
                 self.feed_index = min(len(self.feed_items) - 1, self.feed_index + 1)
+            elif self.mode == "search" and self.search_items:
+                self.search_index = min(len(self.search_items) - 1, self.search_index + 1)
             elif self.mode == "creator" and self.creator_items:
                 self.creator_index = min(len(self.creator_items) - 1, self.creator_index + 1)
             elif self.mode == "dms" and self.dms_items:
@@ -712,31 +804,42 @@ class TerminalUI:
         elif key in ("PAGE_UP", "MOUSE_UP"):
             if self.mode == "feed":
                 self.feed_index = max(0, self.feed_index - 5)
+            elif self.mode == "search":
+                self.search_index = max(0, self.search_index - 5)
             elif self.mode == "creator":
                 self.creator_index = max(0, self.creator_index - 5)
         elif key in ("PAGE_DOWN", "MOUSE_DOWN"):
             if self.mode == "feed":
                 self.feed_index = min(len(self.feed_items) - 1, self.feed_index + 5)
+            elif self.mode == "search":
+                self.search_index = min(len(self.search_items) - 1, self.search_index + 5)
             elif self.mode == "creator":
                 self.creator_index = min(len(self.creator_items) - 1, self.creator_index + 5)
         elif key == "TAB":
             # Cycle modes
-            modes = ["feed", "creator", "dms"]
-            idx = modes.index(self.mode)
+            modes = ["feed", "search", "creator", "dms"]
+            idx = modes.index(self.mode) if self.mode in modes else 0
             self.mode = modes[(idx + 1) % len(modes)]
             self.set_status(f"Switched to {self.mode.upper()} mode.", CYAN)
         elif key in ("1",):
             self.mode = "feed"
         elif key in ("2",):
-            self.mode = "creator"
+            self.mode = "search"
         elif key in ("3",):
+            self.mode = "creator"
+        elif key in ("4",):
             self.mode = "dms"
         elif key == "t":
             self.action_view_thumbnail()
         elif key == "ENTER":
             self.action_play_selected()
         elif key == "r":
-            self.load_feed()
+            if self.mode == "search" and self.current_search_query:
+                self.load_search(self.current_search_query)
+            elif self.mode == "creator":
+                self.load_creator(self.current_creator)
+            else:
+                self.load_feed()
         elif key == "/":
             self.start_search_prompt()
         elif key == ":":
@@ -764,16 +867,19 @@ class TerminalUI:
 
     def start_search_prompt(self):
         self.input_mode = True
-        self.input_prompt = "Search creator (@handle) or paste TikTok URL: "
+        self.input_prompt = "Search (keyword, @creator, or URL): "
         self.input_buffer = ""
 
         def on_submit(val: str):
-            if not val:
+            clean = val.strip()
+            if not clean:
                 return
-            if val.startswith("http://") or val.startswith("https://"):
-                self.load_direct_url(val)
+            if clean.startswith("http://") or clean.startswith("https://"):
+                self.load_direct_url(clean)
+            elif clean.startswith("@"):
+                self.load_creator(clean)
             else:
-                self.load_creator(val)
+                self.load_search(clean)
 
         self.input_action = on_submit
 
@@ -790,9 +896,14 @@ class TerminalUI:
                 self.action_download_selected()
             elif cmd in ("m", "audio"):
                 self.action_audio_selected()
+            elif cmd.startswith("s ") or cmd.startswith("search "):
+                q = cmd.split(" ", 1)[1]
+                self.load_search(q)
             elif cmd.startswith("user ") or cmd.startswith("creator "):
                 user = cmd.split(" ", 1)[1]
                 self.load_creator(user)
+            elif cmd in ("feed", "fyp"):
+                self.mode = "feed"
             elif cmd in ("thumb", "thumbnail", "cover"):
                 self.action_view_thumbnail()
             elif cmd == "login":
@@ -801,7 +912,7 @@ class TerminalUI:
                 self.client.logout()
                 self.set_status("Logged out. Switched to Guest Mode.", YELLOW)
             elif cmd == "help":
-                self.set_status("Keys: Enter=watch (MPV), t=cover/photos (IMV), :d=download, :m=audio, /=search, :q=quit", CYAN)
+                self.set_status("Keys: Enter=watch (MPV), t=cover/photos (IMV), :s=search, :d=download, :m=audio, /=search, :q=quit", CYAN)
             elif cmd:
                 self.set_status(f"Unknown command: :{cmd}", RED)
 
@@ -831,8 +942,19 @@ class TerminalUI:
     # -------------------------------------------------------------------------
 
     def get_selected_video(self) -> Optional[Dict[str, Any]]:
-        items = self.feed_items if self.mode == "feed" else self.creator_items
-        idx = self.feed_index if self.mode == "feed" else self.creator_index
+        if self.mode == "feed":
+            items = self.feed_items
+            idx = self.feed_index
+        elif self.mode == "search":
+            items = self.search_items
+            idx = self.search_index
+        elif self.mode == "creator":
+            items = self.creator_items
+            idx = self.creator_index
+        else:
+            items = []
+            idx = 0
+
         if items and 0 <= idx < len(items):
             return items[idx]
         return None
@@ -855,14 +977,40 @@ class TerminalUI:
 
     def action_play_selected(self):
         """Play feed in external MPV window with looping, next/prev scrolling, and pos tracking."""
-        items = self.feed_items if self.mode == "feed" else self.creator_items
-        idx = self.feed_index if self.mode == "feed" else self.creator_index
+        if self.mode == "feed":
+            items = self.feed_items
+            idx = self.feed_index
+        elif self.mode == "search":
+            items = self.search_items
+            idx = self.search_index
+        elif self.mode == "creator":
+            items = self.creator_items
+            idx = self.creator_index
+        else:
+            items = []
+            idx = 0
+
         if not items or not (0 <= idx < len(items)):
             self.set_status("No video selected.", RED)
             return
 
         video = items[idx]
         author = video.get("author_id", "creator")
+
+        # If play_url is web_url, do a fast attempt to resolve direct CDN stream
+        if video.get("play_url") == video.get("web_url") and not video.get("resolved_cdn"):
+            try:
+                resolved = self.client.resolve_video_url(video["web_url"])
+                if resolved and resolved.get("play_url"):
+                    video["play_url"] = resolved["play_url"]
+                    if resolved.get("cover_url"):
+                        video["cover_url"] = resolved["cover_url"]
+                    if resolved.get("duration"):
+                        video["duration"] = resolved["duration"]
+                    video["resolved_cdn"] = True
+            except Exception:
+                pass
+
         self.set_status(f"Launching MPV: @{author} [j/↓: Next, k/↑: Prev, ESC/q: Exit]", CYAN)
         self.draw()
 
@@ -872,12 +1020,16 @@ class TerminalUI:
             vo_driver="mpv"
         )
 
+        h = getattr(self, "last_content_height", 15)
         if self.mode == "feed":
             self.feed_index = new_idx
-            self.feed_scroll_offset = self.get_scroll_offset(new_idx, self.feed_scroll_offset, 20, len(items))
-        else:
+            self.feed_scroll_offset = self.get_scroll_offset(new_idx, self.feed_scroll_offset, h, len(items))
+        elif self.mode == "search":
+            self.search_index = new_idx
+            self.search_scroll_offset = self.get_scroll_offset(new_idx, self.search_scroll_offset, h, len(items))
+        elif self.mode == "creator":
             self.creator_index = new_idx
-            self.creator_scroll_offset = self.get_scroll_offset(new_idx, self.creator_scroll_offset, 20, len(items))
+            self.creator_scroll_offset = self.get_scroll_offset(new_idx, self.creator_scroll_offset, h, len(items))
 
         self.force_clear = True
         self.set_status(msg, GREEN)
