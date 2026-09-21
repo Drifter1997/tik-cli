@@ -41,3 +41,10 @@ def test_play_feed_no_urls():
     assert idx == 0
     assert "No playable videos" in msg
 
+
+def test_strip_ansi_private_modes():
+    from tikcli.ui import strip_ansi
+    raw = "\x1b[?25l\x1b[38;2;254;44;85mText\x1b[0m\x1b[?25h"
+    assert strip_ansi(raw) == "Text"
+
+

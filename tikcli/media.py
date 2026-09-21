@@ -45,7 +45,7 @@ def fetch_bytes_in_ram(url: str, timeout: int = 15) -> Optional[bytes]:
 def get_terminal_pixel_size() -> Tuple[int, int]:
     """
     Determine exact terminal pixel dimensions.
-    Queries Sway window geometry on Wayland (eDP-1 / foot), with TIOCGWINSZ / cell fallback.
+    Queries Sway window geometry on Wayland (eDP-1 / foot), accounting for window padding.
     """
     if os.environ.get("SWAYSOCK"):
         try:
@@ -54,15 +54,22 @@ def get_terminal_pixel_size() -> Tuple[int, int]:
             tree = json.loads(res.stdout)
             def find_foot(node):
                 if node.get("app_id") == "foot" and node.get("visible", True):
-                    return node.get("rect")
+                    return node
                 for c in node.get("nodes", []) + node.get("floating_nodes", []):
                     f = find_foot(c)
                     if f:
                         return f
                 return None
-            rect = find_foot(tree)
-            if rect and rect.get("width", 0) > 0 and rect.get("height", 0) > 0:
-                return int(rect["width"]), int(rect["height"])
+            foot_node = find_foot(tree)
+            if foot_node:
+                w_rect = foot_node.get("window_rect") or foot_node.get("rect")
+                if w_rect and w_rect.get("width", 0) > 0 and w_rect.get("height", 0) > 0:
+                    w = int(w_rect["width"])
+                    h = int(w_rect["height"])
+                    # Subtract Foot's 10x10 padding (20px total per axis) so video never overflows/scrolls
+                    pad_x = 20 if w > 100 else 0
+                    pad_y = 20 if h > 100 else 0
+                    return max(320, w - pad_x), max(240, h - pad_y)
         except Exception:
             pass
 
@@ -84,18 +91,18 @@ def get_inline_thumbnail(image_url: str, max_width: int = THUMB_MAX_WIDTH, max_h
         return ""
 
     try:
-        # Run chafa with 24-bit TrueColor, clean half-block pixel grid, and median color accuracy
+        # Run chafa with 24-bit TrueColor, clean half-block pixel grid, and optimal scale
         result = subprocess.run(
             [
                 CHAFA_PATH,
                 "-s", f"{max_width}x{max_height}",
+                "--scale=max",
                 "--format=symbols",
                 "-c", "full",
                 "--symbols=half",
                 "--color-extractor=median",
-                "--work=9",
+                "--work=5",
                 "--dither=none",
-                "--polite=on",
                 "-"
             ],
             input=raw_bytes,
@@ -103,7 +110,10 @@ def get_inline_thumbnail(image_url: str, max_width: int = THUMB_MAX_WIDTH, max_h
             timeout=8
         )
         if result.returncode == 0 and result.stdout:
-            raw_lines = result.stdout.decode("utf-8", errors="replace").splitlines()
+            raw_text = result.stdout.decode("utf-8", errors="replace")
+            # Strip cursor hide/show sequences (\x1b[?25l / \x1b[?25h) so they don't break row alignments
+            raw_text = re.sub(r'\x1b\[\?[0-9]+[hl]', '', raw_text)
+            raw_lines = raw_text.splitlines()
             clean_lines = [line.rstrip() + "\033[0m" for line in raw_lines if line.strip()]
             rendered = "\n".join(clean_lines)
             _THUMBNAIL_CACHE[cache_key] = rendered
@@ -221,7 +231,6 @@ end)
     cmd = [
         MPV_PATH,
         "--no-config",
-        "--terminal=yes",
         "--force-window=no",
         "--loop-file=inf",             # Loop current video indefinitely!
         "--loop-playlist=inf",         # Continuous playlist navigation
@@ -229,27 +238,27 @@ end)
         f"--playlist-start={m3u_start_idx}",
         f"--input-conf={input_conf_file}",
         f"--script={tracker_lua}",
-        "--osd-playing-msg=📱 ${media-title} [j/↓: Next, k/↑: Prev, Space: Pause, ESC/q: Exit]",
-        "--term-osd-bar=yes",
-        "--msg-level=all=no",
+        "--really-quiet",              # Prevent stdout text from interrupting and corrupting video frames
+        "--terminal=no",               # Never interleave stdout terminal text with graphic escape sequences
+        "--no-term-osd-bar",
         "--http-header-fields-append=Referer: https://www.tiktok.com/",
         "--http-header-fields-append=User-Agent: Mozilla/5.0 (X11; Linux x86_64)",
     ]
 
     if selected_driver == "sixel":
-        # Sixel graphics with high-res window dimensions (e.g. 1536x834 on Foot)
+        # Dynamic high-fidelity Sixel graphics: no fixed palette, no dithering grains, full vertical height
         cmd.extend([
             "--vo=sixel",
-            f"--vo-sixel-cols={cols}",
-            f"--vo-sixel-rows={rows}",
             f"--vo-sixel-width={pixel_w}",
             f"--vo-sixel-height={pixel_h}",
-            "--profile=sw-fast",
-            "--vo-sixel-fixedpalette=yes",
+            "--vo-sixel-fixedpalette=no",   # Dynamic adaptive palette: eliminates Windows 98 8-bit VGA look!
+            "--vo-sixel-threshold=-1",      # Per-frame palette optimization for maximum color fidelity
+            "--vo-sixel-reqcolors=256",     # Full 256 colors per frame
+            "--vo-sixel-dither=none",       # Eradicate all dithering grain noise!
             "--vo-sixel-buffered=yes",
         ])
     else:
-        # TrueColor text terminal fallback
+        # TrueColor text terminal fallback (16.7M 24-bit TrueColor)
         cmd.extend([
             "--vo=tct",
             f"--vo-tct-width={cols}",

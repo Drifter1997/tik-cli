@@ -53,9 +53,12 @@ BG_RED = "\033[48;2;254;44;85m"
 _key_buffer: List[str] = []
 
 
+ANSI_REGEX = re.compile(r'\x1b(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
+
+
 def strip_ansi(text: str) -> str:
-    """Remove ANSI escape sequences for accurate string length measuring."""
-    return re.sub(r'\033\[[0-9;]*[a-zA-Z]', '', text)
+    """Remove all ANSI escape sequences for accurate visible string length measuring."""
+    return ANSI_REGEX.sub('', text)
 
 
 class RawTerminal:
@@ -463,8 +466,8 @@ class TerminalUI:
 
         # 1. Inline Thumbnail via chafa in RAM
         cover_url = video.get("cover_url", "")
-        thumb_h = max(10, min(24, height - 8))
-        thumb_w = min(width - 4, 36)
+        thumb_h = max(12, min(26, height - 7))
+        thumb_w = min(width - 2, 48)
 
         if cover_url:
             cache_key = f"{cover_url}:{thumb_w}x{thumb_h}"
