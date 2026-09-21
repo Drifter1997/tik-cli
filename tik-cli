@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+set -e
+
+SCRIPT_DIR="$(dirname "$(realpath "${BASH_SOURCE[0]}")")"
+VENV_DIR="$SCRIPT_DIR/.venv"
+
+if [ ! -d "$VENV_DIR" ] || [ ! -f "$VENV_DIR/bin/python" ]; then
+    echo "Virtual environment not detected. Running initial setup..."
+    bash "$SCRIPT_DIR/setup.sh"
+fi
+
+exec "$VENV_DIR/bin/python" "$SCRIPT_DIR/main.py" "$@"
