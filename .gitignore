@@ -1,6 +1,38 @@
+# Python virtual environments & cache
 .venv/
+venv/
+ENV/
+env/
 __pycache__/
-*.pyc
+*.py[cod]
+*$py.class
+
+# Pytest and logs
 .pytest_cache/
-downloads/
+.coverage
+htmlcov/
+*.log
 *.tmp
+.tmp/
+
+# Downloaded or cached media
+downloads/
+*.mp4
+*.mp3
+*.jpg
+*.jpeg
+*.png
+*.webp
+
+# Credentials and secrets protection
+session.json
+*session*.json
+device.json
+*.cookie*
+*.cookies
+tokens/
+*.token*
+.env
+.env.*
+*credentials*
+*secret*
